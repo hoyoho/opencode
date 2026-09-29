@@ -7,6 +7,9 @@ import { SessionID, MessageID, PartID } from "./schema"
 import { MessageV2 } from "./message-v2"
 import { SessionRevert } from "./revert"
 import { Session } from "./session"
+import { renderRoster, partnershipOf, roomOf } from "./collaboration"
+import { SessionLease } from "./lease"
+import { parseManagerCommand } from "./manager-commands"
 import { Agent } from "../agent/agent"
 import { Provider } from "@/provider/provider"
 
@@ -42,9 +45,10 @@ import { Truncate } from "@/tool/truncate"
 import { Image } from "@/image/image"
 import { decodeDataUrl } from "@/util/data-url"
 import { Process } from "@/util/process"
-import { Cause, Effect, Exit, Latch, Layer, Option, Scope, Context, Schema, Types } from "effect"
+import { Cause, Effect, Exit, Latch, Layer, Option, Scope, Context, Schema, Types, Duration } from "effect"
 import { InstanceState } from "@/effect/instance-state"
 import { TaskTool, type TaskPromptOps } from "@/tool/task"
+import { drainDeliveries } from "@/tool/wake"
 import { SessionRunState } from "./run-state"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { EventV2Bridge } from "@/event-v2-bridge"
@@ -63,6 +67,8 @@ globalThis.AI_SDK_LOG_WARNINGS = false
 const decodeMessageInfo = Schema.decodeUnknownExit(SessionV1.Info)
 const decodeMessagePart = Schema.decodeUnknownExit(SessionV1.Part)
 const MAX_MCP_RESOURCE_BLOB_BYTES = 10 * 1024 * 1024
+// Renew the session lease well before its TTL (90s) so a live run keeps it.
+const LEASE_RENEW_MS = 30_000
 const SUPPORTED_MCP_RESOURCE_ATTACHMENT_MIMES = new Set([
   "application/pdf",
   "image/gif",
@@ -104,7 +110,7 @@ export interface Interface {
   readonly prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error>
   readonly loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts>
   readonly shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError>
-  readonly command: (input: CommandInput) => Effect.Effect<SessionV1.WithParts, Image.Error>
+  readonly command: (input: CommandInput) => Effect.Effect<SessionV1.WithParts, Image.Error | Session.BusyError>
   readonly resolvePromptParts: (template: string) => Effect.Effect<PromptInput["parts"]>
 }
 
@@ -146,6 +152,7 @@ const layer = Layer.effect(
         cancel: (sessionID: SessionID) => cancel(sessionID),
         resolvePromptParts: (template: string) => resolvePromptParts(template),
         prompt: (input: PromptInput) => prompt(input).pipe(Effect.catch(Effect.die)),
+        loop: (sessionID: SessionID) => loop({ sessionID }),
       } satisfies TaskPromptOps
     })
 
@@ -188,6 +195,23 @@ const layer = Layer.effect(
         { concurrency: "unbounded", discard: true },
       )
       return parts
+    })
+
+    const collaborators = Effect.fn("SessionPrompt.collaborators")(function* (session: Session.Info) {
+      const parent = session.parentID
+        ? yield* sessions.get(session.parentID).pipe(Effect.catchCause(() => Effect.succeed(undefined)))
+        : undefined
+      const siblings = session.parentID
+        ? (yield* sessions.children(session.parentID)).filter((item) => item.id !== session.id)
+        : []
+      const children = yield* sessions.children(session.id)
+      const partnership = partnershipOf(session)
+      const partners = partnership
+        ? (yield* sessions.list())
+            .filter((item) => item.id !== session.id && partnershipOf(item) === partnership)
+            .slice(0, 20)
+        : []
+      return renderRoster(session, { parent, siblings, children, partners, room: roomOf(session) })
     })
 
     const title = Effect.fn("SessionPrompt.ensureTitle")(function* (input: {
@@ -1254,11 +1278,12 @@ const layer = Layer.effect(
 
             yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
 
-            const [skills, env, instructions, mcpInstructions, modelMsgs] = yield* Effect.all([
+            const [skills, env, instructions, mcpInstructions, roster, modelMsgs] = yield* Effect.all([
               sys.skills(agent),
               sys.environment(model),
               instruction.system().pipe(Effect.orDie),
               sys.mcp(agent, session.permission),
+              collaborators(session),
               MessageV2.toModelMessagesEffect(msgs, model),
             ])
             const system = [
@@ -1266,6 +1291,7 @@ const layer = Layer.effect(
               ...instructions,
               ...(mcpInstructions ? [mcpInstructions] : []),
               ...(skills ? [skills] : []),
+              ...(roster ? [roster] : []),
             ]
             const format = lastUser.format ?? { type: "text" as const }
             if (format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
@@ -1340,17 +1366,168 @@ const layer = Layer.effect(
       },
     )
 
+    // Claim the cross-process session lease only around the actual run body.
+    // `loop`/`shell` go through SessionRunState, which discards this work when
+    // another run is already in flight, so only the real owner claims/releases.
+    // The renewal fiber is a child of an inner scope so a finished turn cannot
+    // leave a live renewer pinning the lease forever.
+    const withLease = <A, E, R>(sessionID: SessionID, effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
+      Effect.gen(function* () {
+        yield* SessionLease.ensure(db)
+        yield* SessionLease.claim(db, sessionID)
+        return yield* Effect.scoped(
+          Effect.gen(function* () {
+            const inner = yield* Scope.Scope
+            yield* Effect.forever(
+              Effect.sleep(Duration.millis(LEASE_RENEW_MS)).pipe(Effect.andThen(SessionLease.claim(db, sessionID))),
+            ).pipe(Effect.forkIn(inner, { startImmediately: true }))
+            return yield* effect
+          }),
+        )
+      }).pipe(Effect.ensuring(SessionLease.release(db, sessionID)))
+
     const loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.loop")(function* (
       input: LoopInput,
     ) {
-      return yield* state.ensureRunning(input.sessionID, lastAssistant(input.sessionID), runLoop(input.sessionID))
+      return yield* state.ensureRunning(
+        input.sessionID,
+        lastAssistant(input.sessionID),
+        withLease(input.sessionID, runLoop(input.sessionID)),
+      )
     })
 
     const shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError> = Effect.fn(
       "SessionPrompt.shell",
     )(function* (input: ShellInput) {
       const ready = yield* Latch.make()
-      return yield* state.startShell(input.sessionID, lastAssistant(input.sessionID), shellImpl(input, ready), ready)
+      return yield* state.startShell(
+        input.sessionID,
+        lastAssistant(input.sessionID),
+        withLease(input.sessionID, shellImpl(input, ready)),
+        ready,
+      )
+    })
+
+    const runManagerTool = <P extends Schema.Decoder<unknown>>(
+      def: Tool.Def<P>,
+      params: Record<string, unknown>,
+      ctx: Tool.Context,
+    ) =>
+      def.execute(params as unknown as Schema.Schema.Type<P>, ctx).pipe(
+        Effect.map((result) => result.output),
+        // User-facing: a manager-command refusal must read as a sentence, not a
+        // stack trace. The guard errors are plain Errors; render their message
+        // only, and fall back to String() for non-Error defects. (Cause.pretty
+        // stays for logs, not for the persisted assistant reply.)
+        Effect.catchCause((cause) => {
+          const squashed = Cause.squash(cause)
+          const message = squashed instanceof Error ? squashed.message : String(squashed)
+          return Effect.succeed(`Command failed: ${message}`)
+        }),
+      )
+
+    const directReply = Effect.fn("SessionPrompt.directReply")(function* (input: {
+      sessionID: SessionID
+      agent: string
+      model: Provider.Model
+      parentID: MessageID
+      text: string
+    }) {
+      const ictx = yield* InstanceState.context
+      const id = MessageID.ascending()
+      const message: SessionV1.Assistant = {
+        id,
+        parentID: input.parentID,
+        role: "assistant",
+        mode: input.agent,
+        agent: input.agent,
+        path: { cwd: ictx.directory, root: ictx.worktree },
+        cost: 0,
+        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        modelID: input.model.id,
+        providerID: input.model.providerID,
+        time: { created: Date.now(), completed: Date.now() },
+        sessionID: input.sessionID,
+        finish: "stop",
+      }
+      yield* sessions.updateMessage(message)
+      const part = yield* sessions.updatePart({
+        id: PartID.ascending(),
+        messageID: id,
+        sessionID: input.sessionID,
+        type: "text",
+        text: input.text,
+      } satisfies SessionV1.Part)
+      return { info: message, parts: [part] } satisfies SessionV1.WithParts
+    })
+
+    // `/roommgr` and `/partnermgr` run directly: the command is recorded as a
+    // user turn, the room/partner tool executes with sender=user, and the tool
+    // output is written back as an assistant turn. No model round-trip happens.
+    const managerCommand = Effect.fn("SessionPrompt.managerCommand")(function* (
+      input: CommandInput,
+      agent: Agent.Info,
+      modelRef: { providerID: ProviderV2.ID; modelID: ModelV2.ID },
+      model: Provider.Model,
+    ) {
+      const invocation = parseManagerCommand(input.command, input.arguments)
+      // Detaching yourself (room leave/destroy, or partner remove of your own
+      // session id) is the escape hatch out of a room or partnership. A room
+      // wake can keep this session busy, so instead of refusing we interrupt the
+      // local turn and then run. Other manager commands still refuse while busy:
+      // their synthetic turn would truncate an in-flight one.
+      const detach =
+        invocation !== undefined &&
+        "tool" in invocation &&
+        ((invocation.tool === "room" &&
+          (invocation.params.action === "leave" || invocation.params.action === "destroy")) ||
+          (invocation.tool === "partner" &&
+            invocation.params.action === "remove" &&
+            invocation.params.session_id === input.sessionID))
+      // Manager commands write a synthetic assistant turn, which would truncate
+      // an in-flight turn. Refuse while another process is running this session
+      // (the cross-process lease is the only shared signal).
+      yield* SessionLease.ensure(db)
+      if (yield* SessionLease.foreignHeld(db, input.sessionID))
+        return yield* Effect.fail(new Session.BusyError({ sessionID: input.sessionID }))
+      if (detach) {
+        const busy = yield* state
+          .assertNotBusy(input.sessionID)
+          .pipe(Effect.as(false), Effect.catchTag("SessionBusyError", () => Effect.succeed(true)))
+        if (busy) yield* state.cancel(input.sessionID)
+      } else {
+        yield* state.assertNotBusy(input.sessionID)
+      }
+      const user = yield* prompt({
+        sessionID: input.sessionID,
+        messageID: input.messageID,
+        agent: agent.name,
+        model: modelRef,
+        parts: [{ type: "text" as const, text: `/${input.command}${input.arguments ? ` ${input.arguments}` : ""}` }],
+        variant: input.variant,
+        noReply: true,
+      })
+      const fail = (text: string) =>
+        directReply({ sessionID: input.sessionID, agent: agent.name, model, parentID: user.info.id, text })
+      if (!invocation) return yield* fail("Unknown manager command.")
+      if ("error" in invocation) return yield* fail(invocation.error)
+
+      const { room, partner } = yield* registry.named()
+      const toolCtx: Tool.Context = {
+        sessionID: input.sessionID,
+        messageID: user.info.id,
+        agent: agent.name,
+        abort: new AbortController().signal,
+        extra: { promptOps: yield* ops(), sender: "user" },
+        messages: [],
+        metadata: () => Effect.void,
+        ask: () => Effect.void,
+      }
+      const text =
+        invocation.tool === "room"
+          ? yield* runManagerTool(room, invocation.params, toolCtx)
+          : yield* runManagerTool(partner, invocation.params, toolCtx)
+      return yield* fail(text)
     })
 
     const command = Effect.fn("SessionPrompt.command")(function* (input: CommandInput) {
@@ -1418,8 +1595,7 @@ const layer = Layer.effect(
         return yield* currentModel(input.sessionID)
       })
 
-      yield* getModel(taskModel.providerID, taskModel.modelID, input.sessionID)
-
+      const resolvedModel = yield* getModel(taskModel.providerID, taskModel.modelID, input.sessionID)
       const agent = agentName ? yield* agents.get(agentName) : yield* agents.defaultInfo()
       if (!agent) {
         const available = (yield* agents.list()).filter((a) => !a.hidden).map((a) => a.name)
@@ -1427,6 +1603,25 @@ const layer = Layer.effect(
         const error = new NamedError.Unknown({ message: `Agent not found: "${agentName}".${hint}` })
         yield* events.publish(Session.Event.Error, { sessionID: input.sessionID, error: error.toObject() })
         throw error
+      }
+
+      if (input.command === Command.Default.ROOMMGR || input.command === Command.Default.PARTNERMGR) {
+        const managerParts: PromptInput["parts"] = [
+          { type: "text", text: `/${input.command}${input.arguments ? ` ${input.arguments}` : ""}` },
+        ]
+        yield* plugin.trigger(
+          "command.execute.before",
+          { command: input.command, sessionID: input.sessionID, arguments: input.arguments },
+          { parts: managerParts },
+        )
+        const result = yield* managerCommand(input, agent, taskModel, resolvedModel)
+        yield* events.publish(Command.Event.Executed, {
+          name: input.command,
+          sessionID: input.sessionID,
+          arguments: input.arguments,
+          messageID: result.info.id,
+        })
+        return result
       }
 
       const templateParts = yield* resolvePromptParts(template)
@@ -1479,6 +1674,15 @@ const layer = Layer.effect(
       })
       return result
     })
+
+    // Flush deliveries deferred while a session was busy the moment it becomes
+    // idle, then wake it. This is what lets an async room/partner message reach
+    // a session without interrupting a running turn.
+    yield* state.setOnIdle((sessionID) =>
+      Effect.gen(function* () {
+        yield* drainDeliveries({ ops: yield* ops(), statuses: status, sessions, scope, db }, sessionID)
+      }).pipe(Effect.catchCause(() => Effect.void)),
+    )
 
     return Service.of({
       cancel,

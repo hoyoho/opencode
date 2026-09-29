@@ -110,6 +110,7 @@ function stubOps(opts?: {
         opts?.onPrompt?.(input)
         return reply(input, opts?.text ?? "done", opts?.error, opts?.toolError)
       }),
+    loop: () => Effect.never,
   }
 }
 
@@ -436,6 +437,7 @@ describe("tool.task", () => {
             ready.resolve(input)
             return cancelled.promise
           }).pipe(Effect.as(reply(input, "cancelled"))),
+        loop: () => Effect.never,
       }
 
       const fiber = yield* def
@@ -707,6 +709,7 @@ describe("tool.task", () => {
             return reply(input, "background done")
           })
         },
+        loop: () => Effect.never,
       }
 
       const fiber = yield* def

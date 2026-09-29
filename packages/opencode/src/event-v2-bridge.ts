@@ -11,6 +11,21 @@ import { Context, Effect, Layer } from "effect"
 
 export class Service extends Context.Service<Service, EventV2.Interface>()("@opencode/EventV2Bridge") {}
 
+const LOCAL_EMIT_LIMIT = 20000
+/** Ids of events published by this process, so the cross-process relay can skip them. */
+export const recentlyEmitted = new Set<string>()
+
+function rememberLocal(id: string) {
+  recentlyEmitted.add(id)
+  if (recentlyEmitted.size <= LOCAL_EMIT_LIMIT) return
+  const excess = recentlyEmitted.size - Math.floor(LOCAL_EMIT_LIMIT / 2)
+  let removed = 0
+  for (const key of recentlyEmitted) {
+    recentlyEmitted.delete(key)
+    if (++removed >= excess) break
+  }
+}
+
 const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
@@ -34,6 +49,7 @@ const layer = Layer.effect(
 
     const unsubscribe = yield* events.listen((event) =>
       Effect.gen(function* () {
+        rememberLocal(event.id)
         const ctx = yield* InstanceRef
         const workspaceID = (yield* WorkspaceRef) ?? event.location?.workspaceID
         GlobalBus.emit("event", {

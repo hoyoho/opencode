@@ -4,6 +4,7 @@ import { Rpc } from "@/util/rpc"
 import { upgrade } from "@/cli/upgrade"
 import { Config } from "@/config/config"
 import { GlobalBus } from "@/bus/global"
+import { startEventRelay } from "@/bus/event-relay"
 import { ServerAuth } from "@/server/auth"
 import { writeHeapSnapshot } from "node:v8"
 import { Heap } from "@/cli/heap"
@@ -24,6 +25,10 @@ process.on("uncaughtException", onUncaughtException)
 GlobalBus.on("event", (event) => {
   Rpc.emit("global.event", event)
 })
+
+// Surface durable events written by other OpenCode processes on the same
+// database (for example a second terminal's TUI) on this process's bus.
+startEventRelay(AppRuntime)
 
 let server: Awaited<ReturnType<typeof Server.listen>> | undefined
 

@@ -3,7 +3,7 @@ import { InstanceState } from "@/effect/instance-state"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Runner } from "@/effect/runner"
 import { BackgroundJob } from "@/background/job"
-import { Effect, Latch, Layer, Scope, Context } from "effect"
+import { Effect, Latch, Layer, Ref, Scope, Context } from "effect"
 import { Session } from "./session"
 import { SessionID } from "./schema"
 import { SessionStatus } from "./status"
@@ -22,6 +22,11 @@ export interface Interface {
     work: Effect.Effect<SessionV1.WithParts>,
     ready?: Latch.Latch,
   ) => Effect.Effect<SessionV1.WithParts, Session.BusyError>
+  /**
+   * Registers a hook invoked whenever a session transitions to idle (a turn
+   * finished). Used to flush deliveries deferred while the session was busy.
+   */
+  readonly setOnIdle: (hook: (sessionID: SessionID) => Effect.Effect<void>) => Effect.Effect<void>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/SessionRunState") {}
@@ -49,6 +54,8 @@ const layer = Layer.effect(
       }),
     )
 
+    const idleHook = yield* Ref.make<((sessionID: SessionID) => Effect.Effect<void>) | undefined>(undefined)
+
     const runner = Effect.fn("SessionRunState.runner")(function* (
       sessionID: SessionID,
       onInterrupt: Effect.Effect<SessionV1.WithParts>,
@@ -60,6 +67,8 @@ const layer = Layer.effect(
         onIdle: Effect.gen(function* () {
           data.runners.delete(sessionID)
           yield* status.set(sessionID, { type: "idle" })
+          const hook = yield* Ref.get(idleHook)
+          if (hook) yield* hook(sessionID).pipe(Effect.catchCause(() => Effect.void))
         }),
         onBusy: status.set(sessionID, { type: "busy" }),
         onInterrupt,
@@ -104,7 +113,9 @@ const layer = Layer.effect(
         .pipe(Effect.catchTag("RunnerBusy", () => Effect.fail(busyError(sessionID))))
     })
 
-    return Service.of({ assertNotBusy, cancel, ensureRunning, startShell })
+    const setOnIdle = (hook: (sessionID: SessionID) => Effect.Effect<void>) => Ref.set(idleHook, hook)
+
+    return Service.of({ assertNotBusy, cancel, ensureRunning, startShell, setOnIdle })
   }),
 )
 

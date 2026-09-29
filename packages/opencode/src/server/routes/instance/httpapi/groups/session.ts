@@ -345,7 +345,7 @@ export const SessionApi = HttpApi.make("session")
           query: WorkspaceRoutingQuery,
           payload: CommandPayload,
           success: described(SessionV1.WithParts, "Created message"),
-          error: [HttpApiError.BadRequest, ApiNotFoundError],
+          error: [HttpApiError.BadRequest, ApiNotFoundError, SessionBusyError],
         }).annotateMerge(
           OpenApi.annotations({
             identifier: "session.command",

@@ -19,6 +19,7 @@ export interface TaskPromptOps {
   cancel(sessionID: SessionID): Effect.Effect<void>
   resolvePromptParts(template: string): Effect.Effect<SessionPrompt.PromptInput["parts"]>
   prompt(input: SessionPrompt.PromptInput): Effect.Effect<SessionV1.WithParts>
+  loop(sessionID: SessionID): Effect.Effect<SessionV1.WithParts>
 }
 
 const id = "task"

@@ -7,6 +7,14 @@ import { statics } from "@opencode-ai/core/schema"
 export const SessionID = SessionV2.ID
 export type SessionID = Schema.Schema.Type<typeof SessionID>
 
+const sessionIDPattern = /ses_[0-9A-Za-z]+/
+
+/** Extracts a session id token from free-form text so models can pass extra words safely. */
+export function parseSessionID(value: string): SessionID | undefined {
+  const match = value.match(sessionIDPattern)
+  return match ? SessionID.make(match[0]) : undefined
+}
+
 export const MessageID = Schema.String.check(Schema.isStartsWith("msg")).pipe(
   Schema.brand("MessageID"),
   statics((s) => ({

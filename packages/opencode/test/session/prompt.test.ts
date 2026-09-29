@@ -35,6 +35,8 @@ import { SessionSummary } from "../../src/session/summary"
 import { Instruction } from "../../src/session/instruction"
 import { SessionProcessor } from "../../src/session/processor"
 import { SessionPrompt } from "../../src/session/prompt"
+import { SessionLease } from "../../src/session/lease"
+import { roomOf } from "../../src/session/collaboration"
 import { SessionRevert } from "../../src/session/revert"
 import { SessionRunState } from "../../src/session/run-state"
 import { MessageID, PartID, SessionID } from "../../src/session/schema"
@@ -1842,6 +1844,361 @@ unix(
       }),
     ),
   30_000,
+)
+
+noLLMServer.instance(
+  "roommgr command runs directly without the model",
+  () =>
+    Effect.gen(function* () {
+      const { prompt, chat } = yield* boot()
+
+      const created = yield* prompt.command({ sessionID: chat.id, command: "roommgr", arguments: "create Direct" })
+      expect(created.info.role).toBe("assistant")
+      const createdText = created.parts.findLast((part) => part.type === "text")?.text ?? ""
+      expect(createdText).toContain("Room created")
+
+      const status = yield* prompt.command({ sessionID: chat.id, command: "roommgr", arguments: "status" })
+      const statusText = status.parts.findLast((part) => part.type === "text")?.text ?? ""
+      expect(statusText).toContain("<room_members>")
+    }),
+  { config: cfg },
+)
+
+noLLMServer.instance(
+  "partnermgr command runs directly without the model",
+  () =>
+    Effect.gen(function* () {
+      const { prompt, chat } = yield* boot()
+
+      const status = yield* prompt.command({ sessionID: chat.id, command: "partnermgr", arguments: "status" })
+      expect(status.info.role).toBe("assistant")
+      const text = status.parts.findLast((part) => part.type === "text")?.text ?? ""
+      expect(text).toContain("You are not in a partnership")
+    }),
+  { config: cfg },
+)
+
+// P0-C: a manager command must be refused while a turn is running, and must not
+// write anything. Without the guard its directReply assistant message satisfies
+// the loop exit test (prompt.ts:1134-1139) and truncates the in-flight turn.
+it.instance(
+  "roommgr is refused while a turn is running and leaves the turn intact",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const gate = yield* Deferred.make<void>()
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Pinned" })
+
+      yield* llm.hold("first", deferredAsPromise(gate))
+      yield* llm.text("second")
+
+      const fiber = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          agent: "build",
+          model: ref,
+          parts: [{ type: "text", text: "first" }],
+        })
+        .pipe(Effect.forkChild)
+
+      yield* llm.wait(1)
+      yield* waitForBusy(chat.id)
+
+      const exit = yield* prompt
+        .command({ sessionID: chat.id, command: "roommgr", arguments: "create Busy" })
+        .pipe(Effect.exit)
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isFailure(exit)) expect(Cause.squash(exit.cause)).toBeInstanceOf(Session.BusyError)
+
+      yield* Deferred.succeed(gate, void 0)
+      yield* Fiber.await(fiber)
+
+      const msgs = yield* sessions.messages({ sessionID: chat.id })
+      const users = msgs.filter((m) => m.info.role === "user")
+      expect(users).toHaveLength(1)
+      const first = msgs.find((m) => m.info.role === "assistant")
+      expect(first?.info.role === "assistant" ? first.info.finish : undefined).toBe("stop")
+    }),
+  { config: cfg },
+)
+
+// P0-C: the same guard must hold across processes, where the local
+// SessionRunState map is empty. A foreign live lease is the only signal.
+it.instance(
+  "roommgr is refused while another process holds the session lease",
+  () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Pinned" })
+
+      yield* SessionLease.ensure(database.db)
+      yield* SessionLease.claim(database.db, chat.id, 30_000, "another-process")
+
+      const exit = yield* prompt
+        .command({ sessionID: chat.id, command: "roommgr", arguments: "create Leased" })
+        .pipe(Effect.exit)
+      expect(Exit.isFailure(exit)).toBe(true)
+
+      const msgs = yield* sessions.messages({ sessionID: chat.id })
+      expect(msgs.filter((m) => m.info.role === "user")).toHaveLength(0)
+    }),
+  { config: cfg },
+)
+
+// leave/destroy are the escape hatch out of a room. Unlike the other manager
+// commands, they must still run while the session is busy (for example, woken
+// by a room post): the running turn is interrupted instead of refusing.
+it.instance(
+  "roommgr leave interrupts a running turn instead of refusing",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const gate = yield* Deferred.make<void>()
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Leaver" })
+
+      // Join a room first so `leave` has something to detach from.
+      yield* prompt.command({ sessionID: chat.id, command: "roommgr", arguments: "create Temp" })
+
+      yield* llm.hold("first", deferredAsPromise(gate))
+      yield* llm.text("second")
+
+      const fiber = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          agent: "build",
+          model: ref,
+          parts: [{ type: "text", text: "first" }],
+        })
+        .pipe(Effect.forkChild)
+
+      yield* llm.wait(1)
+      yield* waitForBusy(chat.id)
+
+      const left = yield* prompt.command({ sessionID: chat.id, command: "roommgr", arguments: "leave" })
+      const text = left.parts.findLast((part) => part.type === "text")?.text ?? ""
+      expect(text).toContain("Left room")
+      expect(roomOf(yield* sessions.get(chat.id))).toBeUndefined()
+
+      yield* Deferred.succeed(gate, void 0)
+      yield* Fiber.await(fiber).pipe(Effect.exit)
+    }),
+  { config: cfg },
+)
+
+it.instance(
+  "roommgr issues no model call",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Pinned" })
+
+      yield* prompt.command({ sessionID: chat.id, command: "roommgr", arguments: "create Silent" })
+      yield* prompt.command({ sessionID: chat.id, command: "roommgr", arguments: "status" })
+
+      expect(yield* llm.calls).toBe(0)
+    }),
+  { config: cfg },
+)
+
+noLLMServer.instance(
+  "roommgr records one user turn and one parented assistant reply per command",
+  () =>
+    Effect.gen(function* () {
+      const { prompt, sessions, chat } = yield* boot()
+
+      yield* prompt.command({ sessionID: chat.id, command: "roommgr", arguments: "create Direct" })
+      yield* prompt.command({ sessionID: chat.id, command: "roommgr", arguments: "status" })
+
+      const msgs = yield* sessions.messages({ sessionID: chat.id })
+      expect(msgs).toHaveLength(4)
+      expect(msgs.map((m) => m.info.role)).toEqual(["user", "assistant", "user", "assistant"])
+
+      const text = (m: SessionV1.WithParts) =>
+        m.parts.flatMap((part) => (part.type === "text" && !part.synthetic ? [part.text] : [])).join("")
+      expect(text(msgs[0])).toBe("/roommgr create Direct")
+      expect(text(msgs[2])).toBe("/roommgr status")
+
+      // The reply must hang off the command turn it answers: this linkage is
+      // what the loop exit test keys on.
+      const parentOf = (index: number) => {
+        const info = msgs[index].info
+        if (info.role !== "assistant") throw new Error(`expected assistant at ${index}`)
+        return info.parentID
+      }
+      expect(parentOf(1)).toBe(msgs[0].info.id)
+      expect(parentOf(3)).toBe(msgs[2].info.id)
+    }),
+  { config: cfg },
+)
+
+// P1 (prompt.ts:1417): a tool refusal used to be rendered with `Cause.pretty`,
+// so a user who mistyped a manager command got six frames of our own stack in
+// the reply — and the reply is persisted, so it also sat in the transcript and
+// was resent to the provider on every later turn. The parser-error path was
+// never affected; it is pinned here as a control.
+noLLMServer.instance(
+  "roommgr surfaces a tool refusal as a bare sentence, not a stack trace",
+  () =>
+    Effect.gen(function* () {
+      const { prompt, sessions, chat } = yield* boot()
+
+      const refusal = yield* prompt.command({ sessionID: chat.id, command: "roommgr", arguments: "status" })
+      const refusalText = refusal.parts.findLast((part) => part.type === "text")?.text ?? ""
+      expect(refusalText).toContain("You are not in a room")
+      expect(refusalText).not.toContain("    at ")
+      expect(refusalText).not.toContain("/src/")
+
+      // The id-less commands are answered by the *parser*, so they never reach
+      // the tool and never carry a stack. Pinned because they are the natural
+      // thing to reach for when reproducing this by hand, and a clean `Usage:`
+      // line there looks exactly like a pass.
+      for (const [args, usage] of [
+        ["kick", "Usage: /roommgr kick <session-id>"],
+        ["post", "Usage: /roommgr post <message>"],
+      ]) {
+        const text = yield* prompt.command({ sessionID: chat.id, command: "roommgr", arguments: args })
+        const body = text.parts.findLast((part) => part.type === "text")?.text ?? ""
+        expect(body).toContain(usage)
+        expect(body).not.toContain("    at ")
+      }
+
+      // A non-member room id does reach the tool, which is why a live canary
+      // needs a real room id rather than a bare subcommand.
+      const other = yield* sessions.create({ title: "Other", agent: "build" })
+      const created = yield* prompt.command({ sessionID: other.id, command: "roommgr", arguments: "create Canary" })
+      const createdText = created.parts.findLast((part) => part.type === "text")?.text ?? ""
+      const room = createdText.match(/<room id="(ses_[^"]+)"/)?.[1]
+      if (!room) throw new Error(`no room id in: ${createdText}`)
+      const targeted = yield* prompt.command({
+        sessionID: chat.id,
+        command: "roommgr",
+        arguments: `status ${room}`,
+      })
+      const targetedText = targeted.parts.findLast((part) => part.type === "text")?.text ?? ""
+      expect(targetedText).toContain("not a member")
+      expect(targetedText).not.toContain("    at ")
+
+      const usage = yield* prompt.command({ sessionID: chat.id, command: "roommgr", arguments: "join" })
+      const usageText = usage.parts.findLast((part) => part.type === "text")?.text ?? ""
+      expect(usageText).toContain("Usage: /roommgr join <room-id>")
+      expect(usageText).not.toContain("    at ")
+    }),
+  { config: cfg },
+)
+
+// `/partnermgr` needs the same direct-path coverage as `/roommgr`: the parser
+// tests only pin the parse result, not that the tool actually ran and mutated
+// partnership state. The `talk` case is the automated twin of the operator's
+// quoted-argument canary, so a regression there is caught here rather than only
+// in a manual run.
+noLLMServer.instance(
+  "partnermgr add, status, and talk run directly and mutate partnership state",
+  () =>
+    Effect.gen(function* () {
+      const { prompt, sessions, chat } = yield* boot()
+      const other = yield* sessions.create({ title: "Other", agent: "build" })
+
+      const added = yield* prompt.command({
+        sessionID: chat.id,
+        command: "partnermgr",
+        arguments: `add ${other.id}`,
+      })
+      const addedText = added.parts.findLast((part) => part.type === "text")?.text ?? ""
+      expect(addedText).not.toContain("not in partnership")
+
+      // `add` must land on both sides, otherwise one of them can never receive
+      // a talk/broadcast and the partnership is silently one-way.
+      const mine = yield* sessions.get(chat.id)
+      const theirs = yield* sessions.get(other.id)
+      const partnerOf = (info: typeof mine) => info.metadata?.["partners"]
+      expect(partnerOf(mine)).toBeDefined()
+      expect(partnerOf(theirs)).toBe(partnerOf(mine))
+
+      const status = yield* prompt.command({ sessionID: chat.id, command: "partnermgr", arguments: "status" })
+      const statusText = status.parts.findLast((part) => part.type === "text")?.text ?? ""
+      expect(statusText).toContain(other.id)
+
+      yield* prompt.command({
+        sessionID: chat.id,
+        command: "partnermgr",
+        arguments: `talk ${other.id} "hello there"`,
+      })
+
+      const delivered = yield* sessions.messages({ sessionID: other.id })
+      const texts = delivered.flatMap((m) =>
+        m.parts.flatMap((part) => (part.type === "text" && part.text ? [part.text] : [])),
+      )
+      const payload = texts.find((text) => text.includes("hello there"))
+      expect(payload).toBeDefined()
+      expect(payload).not.toContain('"hello there"')
+    }),
+  { config: cfg },
+)
+
+noLLMServer.instance(
+  "partnermgr refuses a cross-partnership remove without mutating either session",
+  () =>
+    Effect.gen(function* () {
+      const { prompt, sessions, chat } = yield* boot()
+      const partner = yield* sessions.create({ title: "Partner", agent: "build" })
+      // The target must already be in *some* partnership, otherwise the remove
+      // fails earlier on the "not in a partnership" branch (partner.ts:255) and
+      // never reaches the cross-group guard this test is about (partner.ts:257).
+      const outsider = yield* sessions.create({ title: "Outsider", agent: "build" })
+      const outsiderMate = yield* sessions.create({ title: "OutsiderMate", agent: "build" })
+      yield* prompt.command({ sessionID: chat.id, command: "partnermgr", arguments: `add ${partner.id}` })
+      yield* prompt.command({
+        sessionID: outsider.id,
+        command: "partnermgr",
+        arguments: `add ${outsiderMate.id}`,
+      })
+      const outsiderBefore = yield* sessions.get(outsiderMate.id)
+
+      const removed = yield* prompt.command({
+        sessionID: chat.id,
+        command: "partnermgr",
+        arguments: `remove ${outsiderMate.id}`,
+      })
+      const removedText = removed.parts.findLast((part) => part.type === "text")?.text ?? ""
+
+      expect(removedText).toContain("not in partnership")
+      // The refusal must be inert: detaching or re-homing the target would
+      // silently change a group this session has no standing to change.
+      expect((yield* sessions.get(outsiderMate.id)).metadata?.["partners"]).toBe(
+        outsiderBefore.metadata?.["partners"],
+      )
+      expect((yield* sessions.get(outsiderMate.id)).metadata?.["partners"]).not.toBe(
+        (yield* sessions.get(chat.id)).metadata?.["partners"],
+      )
+      expect((yield* sessions.get(partner.id)).metadata?.["partners"]).toBeDefined()
+    }),
+  { config: cfg },
+)
+
+noLLMServer.instance(
+  "partnermgr remove of your own id detaches directly",
+  () =>
+    Effect.gen(function* () {
+      const { prompt, sessions, chat } = yield* boot()
+      const partner = yield* sessions.create({ title: "Partner", agent: "build" })
+      yield* prompt.command({ sessionID: chat.id, command: "partnermgr", arguments: `add ${partner.id}` })
+
+      const left = yield* prompt.command({ sessionID: chat.id, command: "partnermgr", arguments: `remove ${chat.id}` })
+      const text = left.parts.findLast((part) => part.type === "text")?.text ?? ""
+      expect(text).toContain("You left the partnership")
+      expect((yield* sessions.get(chat.id)).metadata?.["partners"]).toBeUndefined()
+      // The two-member group dissolves, so the partner is cleared as well.
+      expect((yield* sessions.get(partner.id)).metadata?.["partners"]).toBeUndefined()
+    }),
+  { config: cfg },
 )
 
 unixNoLLMServer(

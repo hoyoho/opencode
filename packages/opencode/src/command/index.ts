@@ -46,7 +46,33 @@ export function hints(template: string) {
 export const Default = {
   INIT: "init",
   REVIEW: "review",
+  ROOMMGR: "roommgr",
+  PARTNERMGR: "partnermgr",
 } as const
+
+const ROOMMGR_USAGE = [
+  "roommgr runs directly (no model). Usage:",
+  "  /roommgr create [title]",
+  "  /roommgr destroy [room-id]",
+  "  /roommgr join <room-id>",
+  "  /roommgr leave",
+  "  /roommgr invite <session-id>",
+  "  /roommgr kick <session-id>",
+  "  /roommgr close [room-id]",
+  "  /roommgr open [room-id]",
+  "  /roommgr post <message>",
+  "  /roommgr read [room-id] [limit] [after=<seq>] [before=<seq>] [skip_events]",
+  "  /roommgr status [room-id]",
+].join("\n")
+
+const PARTNERMGR_USAGE = [
+  "partnermgr runs directly (no model). Usage:",
+  "  /partnermgr add <session-id>",
+  "  /partnermgr remove <session-id>",
+  "  /partnermgr broadcast <message>",
+  "  /partnermgr talk <session-id> <message>",
+  "  /partnermgr status",
+].join("\n")
 
 export interface Interface {
   readonly get: (name: string) => Effect.Effect<Info | undefined>
@@ -85,6 +111,26 @@ const layer = Layer.effect(
         },
         subtask: true,
         hints: hints(PROMPT_REVIEW),
+      }
+      commands[Default.ROOMMGR] = {
+        name: Default.ROOMMGR,
+        description:
+          "manage shared rooms (create|destroy|join|leave|invite|kick|close|open|post|read|status) - runs directly without the model",
+        source: "command",
+        get template() {
+          return ROOMMGR_USAGE
+        },
+        hints: [],
+      }
+      commands[Default.PARTNERMGR] = {
+        name: Default.PARTNERMGR,
+        description:
+          "manage partnerships and messaging (add|remove|broadcast|talk|status) - runs directly without the model",
+        source: "command",
+        get template() {
+          return PARTNERMGR_USAGE
+        },
+        hints: [],
       }
 
       for (const [name, command] of Object.entries(cfg.command ?? {})) {

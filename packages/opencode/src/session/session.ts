@@ -428,6 +428,7 @@ export interface Interface {
   readonly setTitle: (input: { sessionID: SessionID; title: string }) => Effect.Effect<void>
   readonly setArchived: (input: { sessionID: SessionID; time?: number }) => Effect.Effect<void>
   readonly setMetadata: (input: typeof SetMetadataInput.Type) => Effect.Effect<void>
+  readonly patchMetadata: (input: { sessionID: SessionID; metadata: Record<string, unknown> }) => Effect.Effect<void>
   readonly setAgentModel: (input: {
     sessionID: SessionID
     agent: string
@@ -762,6 +763,25 @@ const layer: Layer.Layer<
       yield* patch(input.sessionID, { metadata: input.metadata, time: { updated: Date.now() } }).pipe(Effect.orDie)
     })
 
+    // Merge a partial metadata update instead of replacing a whole snapshot
+    // read earlier (which could drop keys another writer set in between).
+    // `undefined` deletes a key. This narrows the lost-update window but the
+    // read and write are still separate round-trips; a single-statement JSON
+    // merge at the projection layer would close it completely.
+    const patchMetadata = Effect.fn("Session.patchMetadata")(function* (input: {
+      sessionID: SessionID
+      metadata: Record<string, unknown>
+    }) {
+      const current = yield* get(input.sessionID).pipe(Effect.catchCause(() => Effect.succeed(undefined)))
+      if (!current) return
+      const next: Record<string, unknown> = { ...(current.metadata ?? {}) }
+      for (const [key, value] of Object.entries(input.metadata)) {
+        if (value === undefined) delete next[key]
+        else next[key] = value
+      }
+      yield* patch(input.sessionID, { metadata: next, time: { updated: Date.now() } }).pipe(Effect.orDie)
+    })
+
     const setAgentModel = Effect.fn("Session.setAgentModel")(function* (input: {
       sessionID: SessionID
       agent: string
@@ -913,6 +933,7 @@ const layer: Layer.Layer<
       setTitle,
       setArchived,
       setMetadata,
+      patchMetadata,
       setAgentModel,
       setPermission,
       setRevert,

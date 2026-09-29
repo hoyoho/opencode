@@ -1,9 +1,9 @@
 import { useProject } from "../../context/project"
 import { useSync } from "../../context/sync"
-import { createMemo, Show } from "solid-js"
+import { createMemo, For, Show } from "solid-js"
 import { useTheme } from "../../context/theme"
 import { useTuiConfig } from "../../config"
-import { InstallationChannel, InstallationVersion } from "@opencode-ai/core/installation/version"
+import { InstallationVersion } from "@opencode-ai/core/installation/version"
 import { usePluginRuntime } from "../../plugin/runtime"
 
 import { getScrollAcceleration } from "../../util/scroll"
@@ -22,6 +22,30 @@ export function Sidebar(props: { sessionID: string; overlay?: boolean }) {
     return project.workspace.get(workspaceID)
   }
   const scrollAcceleration = createMemo(() => getScrollAcceleration(tuiConfig))
+  const partnership = createMemo(() => {
+    const value = session()?.metadata?.partners
+    return typeof value === "string" && value.length > 0 ? value : undefined
+  })
+  const partners = createMemo(() =>
+    partnership()
+      ? sync.data.session.filter(
+          (item) =>
+            item.id !== props.sessionID &&
+            typeof item.metadata?.partners === "string" &&
+            item.metadata.partners === partnership(),
+        )
+      : [],
+  )
+  const room = createMemo(() => {
+    const value = session()?.metadata?.room
+    return typeof value === "string" && value.startsWith("ses") ? value : undefined
+  })
+  const isRoomSession = createMemo(() => session()?.metadata?.isRoom === true)
+  const roomMembers = createMemo(() =>
+    room()
+      ? sync.data.session.filter((item) => item.id !== props.sessionID && item.metadata?.room === room())
+      : [],
+  )
 
   return (
     <Show when={session()}>
@@ -57,9 +81,7 @@ export function Sidebar(props: { sessionID: string; overlay?: boolean }) {
                 <text fg={theme.text}>
                   <b>{session()!.title}</b>
                 </text>
-                <Show when={InstallationChannel !== "latest"}>
-                  <text fg={theme.textMuted}>{props.sessionID}</text>
-                </Show>
+                <text fg={theme.text}>{props.sessionID}</text>
                 <Show when={session()!.workspaceID}>
                   <text fg={theme.textMuted}>
                     <Show
@@ -79,6 +101,25 @@ export function Sidebar(props: { sessionID: string; overlay?: boolean }) {
                 </Show>
                 <Show when={session()!.share?.url}>
                   <text fg={theme.textMuted}>{session()!.share!.url}</text>
+                </Show>
+                <Show when={partnership()}>
+                  <text fg={theme.textMuted}>
+                    Partners: <span style={{ fg: theme.text }}>{partnership()}</span>{" "}
+                    <span>({partners().length})</span>
+                  </text>
+                  <For each={partners()}>{(item) => <text fg={theme.textMuted}>{item.id}</text>}</For>
+                </Show>
+                <Show when={isRoomSession()}>
+                  <text fg={theme.textMuted}>
+                    <span style={{ fg: theme.info }}>Room</span> <span>({roomMembers().length + 1})</span>
+                  </text>
+                </Show>
+                <Show when={room()}>
+                  <text fg={theme.textMuted}>
+                    Room: <span style={{ fg: theme.text }}>{room()}</span>{" "}
+                    <span>({roomMembers().length})</span>
+                  </text>
+                  <For each={roomMembers()}>{(item) => <text fg={theme.textMuted}>{item.id}</text>}</For>
                 </Show>
               </box>
             </pluginRuntime.Slot>

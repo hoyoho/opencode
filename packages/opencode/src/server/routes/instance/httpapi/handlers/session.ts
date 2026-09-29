@@ -36,7 +36,7 @@ import {
   SummarizePayload,
   UpdatePayload,
 } from "../groups/session"
-import { PermissionNotFoundError } from "../errors"
+import { PermissionNotFoundError, SessionBusyError } from "../errors"
 import * as SessionError from "./session-errors"
 
 const tryParseJson = (text: string) =>
@@ -333,9 +333,16 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       payload: typeof CommandPayload.Type
     }) {
       yield* requireSession(ctx.params.sessionID)
-      return yield* promptSvc
-        .command({ ...ctx.payload, sessionID: ctx.params.sessionID })
-        .pipe(Effect.mapError(() => new HttpApiError.BadRequest({})))
+      return yield* promptSvc.command({ ...ctx.payload, sessionID: ctx.params.sessionID }).pipe(
+        Effect.mapError((error) =>
+          error._tag === "SessionBusyError"
+            ? new SessionBusyError({
+                sessionID: error.sessionID,
+                message: `Session is busy: ${error.sessionID}`,
+              })
+            : new HttpApiError.BadRequest({}),
+        ),
+      )
     })
 
     const shell = Effect.fn("SessionHttpApi.shell")(function* (ctx: {

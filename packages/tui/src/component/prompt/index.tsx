@@ -1080,15 +1080,26 @@ export function Prompt(props: PromptProps) {
       const restOfInput = firstLineEnd === -1 ? "" : inputText.slice(firstLineEnd + 1)
       const args = firstLineArgs.join(" ") + (restOfInput ? "\n" + restOfInput : "")
 
-      void sdk.client.session.command({
-        sessionID,
-        command: command.slice(1),
-        arguments: args,
-        agent: agent.name,
-        model: `${selectedModel.providerID}/${selectedModel.modelID}`,
-        variant,
-        parts: nonTextParts.filter((x) => x.type === "file"),
-      })
+      void sdk.client.session
+        .command(
+          {
+            sessionID,
+            command: command.slice(1),
+            arguments: args,
+            agent: agent.name,
+            model: `${selectedModel.providerID}/${selectedModel.modelID}`,
+            variant,
+            parts: nonTextParts.filter((x) => x.type === "file"),
+          },
+          { throwOnError: true },
+        )
+        .catch((error) => {
+          toast.show({
+            title: "Failed to run command",
+            message: errorMessage(error),
+            variant: "error",
+          })
+        })
     } else {
       move.startSubmit()
       sdk.client.session

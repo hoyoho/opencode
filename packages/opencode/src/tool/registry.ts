@@ -10,6 +10,8 @@ import { GlobTool } from "./glob"
 import { GrepTool } from "./grep"
 import { ReadTool } from "./read"
 import { TaskTool } from "./task"
+import { PartnerTool } from "./partner"
+import { RoomTool } from "./room"
 import { Database } from "@opencode-ai/core/database/database"
 import { TodoWriteTool } from "./todo"
 import { WebFetchTool } from "./webfetch"
@@ -45,6 +47,7 @@ import { Instruction } from "../session/instruction"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Agent } from "../agent/agent"
+import { SessionStatus } from "@/session/status"
 import { Skill } from "../skill"
 import { Permission } from "@/permission"
 import { BackgroundJob } from "@/background/job"
@@ -66,18 +69,22 @@ export function webSearchEnabled(providerID: ProviderV2.ID, flags = { exa: false
 
 type TaskDef = Tool.InferDef<typeof TaskTool>
 type ReadDef = Tool.InferDef<typeof ReadTool>
+type PartnerDef = Tool.InferDef<typeof PartnerTool>
+type RoomDef = Tool.InferDef<typeof RoomTool>
 
 type State = {
   custom: Tool.Def[]
   builtin: Tool.Def[]
   task: TaskDef
   read: ReadDef
+  partner: PartnerDef
+  room: RoomDef
 }
 
 export interface Interface {
   readonly ids: () => Effect.Effect<string[]>
   readonly all: () => Effect.Effect<Tool.Def[]>
-  readonly named: () => Effect.Effect<{ task: TaskDef; read: ReadDef }>
+  readonly named: () => Effect.Effect<{ task: TaskDef; read: ReadDef; partner: PartnerDef; room: RoomDef }>
   readonly tools: (model: {
     providerID: ProviderV2.ID
     modelID: ModelV2.ID
@@ -100,6 +107,8 @@ const layer = Layer.effect(
 
     const invalid = yield* InvalidTool
     const task = yield* TaskTool
+    const partner = yield* PartnerTool
+    const room = yield* RoomTool
     const read = yield* ReadTool
     const question = yield* QuestionTool
     const todo = yield* TodoWriteTool
@@ -215,6 +224,8 @@ const layer = Layer.effect(
           edit: Tool.init(edit),
           write: Tool.init(writetool),
           task: Tool.init(task),
+          partner: Tool.init(partner),
+          room: Tool.init(room),
           fetch: Tool.init(webfetch),
           todo: Tool.init(todo),
           search: Tool.init(websearch),
@@ -238,6 +249,8 @@ const layer = Layer.effect(
             tool.edit,
             tool.write,
             tool.task,
+            tool.partner,
+            tool.room,
             tool.fetch,
             tool.todo,
             tool.search,
@@ -249,6 +262,8 @@ const layer = Layer.effect(
           ],
           task: tool.task,
           read: tool.read,
+          partner: tool.partner,
+          room: tool.room,
         }
       }),
     )
@@ -341,7 +356,7 @@ const layer = Layer.effect(
 
     const named: Interface["named"] = Effect.fn("ToolRegistry.named")(function* () {
       const s = yield* InstanceState.get(state)
-      return { task: s.task, read: s.read }
+      return { task: s.task, read: s.read, partner: s.partner, room: s.room }
     })
 
     return Service.of({ ids, all, named, tools })
@@ -435,6 +450,7 @@ export const node = LayerNode.make({
     Agent.node,
     Skill.node,
     Session.node,
+    SessionStatus.node,
     BackgroundJob.node,
     Provider.node,
     LSP.node,
