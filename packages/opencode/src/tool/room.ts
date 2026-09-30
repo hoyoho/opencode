@@ -98,16 +98,21 @@ const renderEvent = (
   subject: Session.Info,
   seq: number,
   actor?: Session.Info,
+  self?: { currentID: string; sender: "user" | "agent" },
 ) => {
-  const who = `${subject.id} (${subject.agent ?? "unknown"})`
+  // A user action is attributed to "user", not to the session it was issued from.
+  const asUser = (id: string) => self?.sender === "user" && id === self.currentID
+  const from = asUser(subject.id) ? "user" : subject.id
+  const byID = actor ? (asUser(actor.id) ? "user" : actor.id) : undefined
+  const subjectLabel = from === "user" ? "The user" : `Session ${from} (${subject.agent ?? "unknown"})`
   const text =
     kind === "kicked"
-      ? `Session ${who} was removed from the room by ${actor?.id ?? "unknown"} (${actor?.agent ?? "unknown"}).`
-      : kind === "joined" && actor
-        ? `Session ${who} was added to the room by ${actor.id} (${actor.agent ?? "unknown"}).`
-        : `Session ${who} ${kind} the room.`
+      ? `${subjectLabel} was removed from the room by ${byID ?? "unknown"}.`
+      : kind === "joined" && byID
+        ? `${subjectLabel} was added to the room by ${byID}.`
+        : `${subjectLabel} ${kind} the room.`
   return [
-    `<room_event room="${room}" type="${kind}" from="${subject.id}" seq="${seq}" at="${now()}"${actor ? ` by="${actor.id}"` : ""}>`,
+    `<room_event room="${room}" type="${kind}" from="${from}" seq="${seq}" at="${now()}"${byID ? ` by="${byID}"` : ""}>`,
     text,
     "</room_event>",
   ].join("\n")
@@ -278,7 +283,7 @@ export const RoomTool = Tool.define(
         yield* sessions.patchMetadata({ sessionID: session.id, metadata: { room: undefined } })
         // Keep the delivery ledger: it acts as a watermark, so a rejoin resumes
         // from the gap instead of replaying the whole transcript.
-        yield* append(previous, (seq) => renderEvent(previous, "left", session, seq))
+        yield* append(previous, (seq) => renderEvent(previous, "left", session, seq, undefined, { currentID: current.id, sender }))
         yield* sync(previous, undefined, false, false, sender === "user")
       })
 
@@ -290,7 +295,7 @@ export const RoomTool = Tool.define(
       if (params.action === "create") {
         const room = yield* sessions.create({ title: params.title ?? "Room", metadata: { isRoom: true } })
         yield* switchAway(current, room.id)
-        const appended = yield* append(room.id, (seq) => renderEvent(room.id, "created", current, seq))
+        const appended = yield* append(room.id, (seq) => renderEvent(room.id, "created", current, seq, undefined, { currentID: current.id, sender }))
         yield* sessions.patchMetadata({ sessionID: current.id, metadata: { room: room.id } })
         yield* RoomDelivery.claimDelivered(db, room.id, current.id, appended.id, appended.seq)
         yield* sync(room.id, undefined, false, false, sender === "user")
@@ -319,7 +324,7 @@ export const RoomTool = Tool.define(
         }
         yield* switchAway(current, room.id)
         yield* sessions.patchMetadata({ sessionID: current.id, metadata: { room: room.id } })
-        const appended = yield* append(room.id, (seq) => renderEvent(room.id, "joined", current, seq))
+        const appended = yield* append(room.id, (seq) => renderEvent(room.id, "joined", current, seq, undefined, { currentID: current.id, sender }))
         yield* RoomDelivery.claimDelivered(db, room.id, current.id, appended.id, appended.seq)
         yield* sync(room.id, undefined, false, false, sender === "user")
         const members = yield* membersOf(room.id)
@@ -370,7 +375,7 @@ export const RoomTool = Tool.define(
           metadata: { action: "invite", room: roomID, session_id: target.id },
         })
         yield* sessions.patchMetadata({ sessionID: target.id, metadata: { room: roomID } })
-        const appended = yield* append(roomID, (seq) => renderEvent(roomID, "joined", target, seq, current))
+        const appended = yield* append(roomID, (seq) => renderEvent(roomID, "joined", target, seq, current, { currentID: current.id, sender }))
         yield* RoomDelivery.claimDelivered(db, roomID, target.id, appended.id, appended.seq)
         yield* RoomDelivery.claimDelivered(db, roomID, current.id, appended.id, appended.seq)
         yield* sync(roomID, undefined, false, false, sender === "user")
@@ -407,7 +412,7 @@ export const RoomTool = Tool.define(
           metadata: { action: "kick", room: roomID, session_id: target.id },
         })
         yield* sessions.patchMetadata({ sessionID: target.id, metadata: { room: undefined } })
-        const appended = yield* append(roomID, (seq) => renderEvent(roomID, "kicked", target, seq, current))
+        const appended = yield* append(roomID, (seq) => renderEvent(roomID, "kicked", target, seq, current, { currentID: current.id, sender }))
         yield* RoomDelivery.claimDelivered(db, roomID, current.id, appended.id, appended.seq)
         yield* sync(roomID, undefined, false, false, sender === "user")
         const metadata: RoomMetadata = {
@@ -435,7 +440,7 @@ export const RoomTool = Tool.define(
           return yield* Effect.fail(new Error(`You are not a member of room ${roomID}`))
         yield* sessions.patchMetadata({ sessionID: current.id, metadata: { room: undefined } })
         // The delivery ledger is kept on every exit path; `forget` has no callers.
-        const appended = yield* append(roomID, (seq) => renderEvent(roomID, "left", current, seq))
+        const appended = yield* append(roomID, (seq) => renderEvent(roomID, "left", current, seq, undefined, { currentID: current.id, sender }))
         yield* sync(roomID, undefined, false, false, sender === "user")
         const members = yield* membersOf(roomID)
         const left: RoomMetadata = {
@@ -527,7 +532,7 @@ export const RoomTool = Tool.define(
           return yield* Effect.fail(new Error(`You are not a member of room ${roomID}`))
         const closed = params.action === "close"
         const appended = yield* append(roomID, (seq) =>
-          renderEvent(roomID, closed ? "closed" : "opened", current, seq),
+          renderEvent(roomID, closed ? "closed" : "opened", current, seq, undefined, { currentID: current.id, sender }),
         )
         yield* sessions.patchMetadata({ sessionID: roomID, metadata: { room_state: closed ? "closed" : "open" } })
         yield* RoomDelivery.claimDelivered(db, roomID, current.id, appended.id, appended.seq)
@@ -562,7 +567,7 @@ export const RoomTool = Tool.define(
           always: ["*"],
           metadata: { action: "destroy", room: roomID },
         })
-        const appended = yield* append(roomID, (seq) => renderEvent(roomID, "destroyed", current, seq, current))
+        const appended = yield* append(roomID, (seq) => renderEvent(roomID, "destroyed", current, seq, current, { currentID: current.id, sender }))
         const members = yield* membersOf(roomID)
         // Clear every member (including the caller) so nobody keeps a dangling
         // room id, then archive the room. The transcript stays readable by id.

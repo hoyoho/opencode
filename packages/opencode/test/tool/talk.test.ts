@@ -1646,6 +1646,27 @@ describe("tool.room", () => {
     { timeout: 30000 },
   )
 
+  // A user operation is attributed to "user" on the event too, not to the
+  // session it was issued from.
+  it.instance("attributes a user-initiated event to user", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const alpha = yield* sessions.create({ title: "Alpha", agent: "build" })
+      const def = yield* (yield* RoomTool).init()
+      const ops = persistingOps(sessions)
+      const room = (yield* def.execute({ action: "create" }, context(alpha.id, ops, { sender: "user" }))).metadata
+        .room
+      yield* def.execute({ action: "destroy", room_id: room }, context(alpha.id, ops, { sender: "user" }))
+
+      const read = yield* def.execute({ action: "read", room_id: room }, context(alpha.id, ops))
+      expect(read.output).toContain('type="destroyed"')
+      expect(read.output).toContain('from="user"')
+      expect(read.output).toContain('by="user"')
+      expect(read.output).toContain("The user destroyed the room")
+    }),
+    { timeout: 30000 },
+  )
+
   // invite and self-join both append type="joined"; the inviter must be recorded
   // so a reader can tell "I invited them" from "they joined themselves".
   it.instance("invite records the inviter on the joined event", () =>
