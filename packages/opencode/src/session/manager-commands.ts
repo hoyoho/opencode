@@ -93,7 +93,7 @@ function parseRoomManager(args: string): ManagerInvocation {
       return {
         error: [
           `Unknown roommgr subcommand: ${sub ?? "(none)"}.`,
-          "/roommgr new [title] | join <room-id> | leave | invite <session-id> | kick <session-id> | close [room-id] | open [room-id] | destroy [room-id] | say <message> | status [room-id]",
+          "/roommgr new [title] | destroy [room-id] | join <room-id> | leave | invite <session-id> | kick <session-id> | close [room-id] | open [room-id] | say <message> | status [room-id]",
         ].join("\n"),
       }
   }

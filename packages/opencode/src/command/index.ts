@@ -53,13 +53,13 @@ export const Default = {
 const ROOMMGR_USAGE = [
   "roommgr runs directly (no model). Usage:",
   "  /roommgr new [title]",
+  "  /roommgr destroy [room-id]",
   "  /roommgr join <room-id>",
   "  /roommgr leave",
   "  /roommgr invite <session-id>",
   "  /roommgr kick <session-id>",
   "  /roommgr close [room-id]",
   "  /roommgr open [room-id]",
-  "  /roommgr destroy [room-id]",
   "  /roommgr say <message>",
   "  /roommgr status [room-id]",
 ].join("\n")
@@ -114,7 +114,7 @@ const layer = Layer.effect(
       commands[Default.ROOMMGR] = {
         name: Default.ROOMMGR,
         description:
-          "manage shared rooms (new|join|leave|invite|kick|close|open|say|status) - runs directly without the model",
+          "manage shared rooms (new|destroy|join|leave|invite|kick|close|open|say|status) - runs directly without the model",
         source: "command",
         get template() {
           return ROOMMGR_USAGE
