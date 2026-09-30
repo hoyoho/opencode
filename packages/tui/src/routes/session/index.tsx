@@ -329,13 +329,13 @@ export function Session() {
   })
 
   // Cross-process updates can miss this TUI's event stream (the durable relay
-  // only covers processes sharing one database). An open room is reconciled
-  // periodically so it keeps updating even without events. Restricted to rooms
-  // so it never races a streaming agent turn in a normal session.
+  // only covers processes sharing one database). An open room is polled so it
+  // keeps updating even without events. The effect depends only on the route, so
+  // store updates never restart it, and the room check runs inside the tick.
   createEffect(() => {
     const sessionID = route.sessionID
-    if (sync.session.get(sessionID)?.metadata?.isRoom !== true) return
     const timer = setInterval(() => {
+      if (sync.session.get(sessionID)?.metadata?.isRoom !== true) return
       void sync.session.pollMessages(sessionID)
     }, 2000)
     onCleanup(() => clearInterval(timer))

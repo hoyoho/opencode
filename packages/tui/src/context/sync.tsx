@@ -555,11 +555,24 @@ export const {
       void bootstrap()
       // Live events carry same-process changes, but a session changed by another
       // process only reaches this TUI through the event relay, which can miss
-      // updates. Reconcile the session list from the server periodically so the
-      // UI always reflects real partnership/room membership.
+      // updates. Refresh the session list from the server periodically so the UI
+      // reflects real partnership/room membership. Upsert only: the list is
+      // directory-scoped, so a replace would drop a session opened from another
+      // directory (and blank its view).
       const timer = setInterval(() => {
         void listSessions()
-          .then((list) => setStore("session", reconcile(list)))
+          .then((list) =>
+            setStore(
+              "session",
+              produce((draft) => {
+                for (const item of list) {
+                  const match = search(draft, item.id, (s) => s.id)
+                  if (match.found) draft[match.index] = item
+                  else draft.push(item)
+                }
+              }),
+            ),
+          )
           .catch(() => {})
       }, 5000)
       onCleanup(() => clearInterval(timer))
