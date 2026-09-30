@@ -280,6 +280,9 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
       })
       for (const part of msg.parts) {
         if (part.type === "text") {
+          // `ignored` text is for the user only (e.g. a manager-command log or
+          // reply); it must not reach the model or cost tokens.
+          if (part.ignored) continue
           const text = part.text === "" && hasSignedReasoning ? " " : part.text
           assistantMessage.parts.push({
             type: "text",

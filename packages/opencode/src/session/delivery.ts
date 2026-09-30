@@ -23,24 +23,28 @@ const ensured = new WeakSet<object>()
 export const ensure = (db: DB): Effect.Effect<void> =>
   Effect.suspend(() => {
     if (ensured.has(db)) return Effect.void
-    return db
-      .run(sql`
+    return Effect.gen(function* () {
+      yield* db.run(sql`
         CREATE TABLE IF NOT EXISTS session_delivery (
           id TEXT PRIMARY KEY,
           session_id TEXT NOT NULL,
           body TEXT NOT NULL,
           wake INTEGER NOT NULL DEFAULT 0,
           force INTEGER NOT NULL DEFAULT 0,
+          admitted INTEGER NOT NULL DEFAULT 0,
           created_at INTEGER NOT NULL,
           claimed_at INTEGER,
           claimed_by TEXT,
           delivered_at TEXT
         )
       `)
-      .pipe(
-        Effect.tap(() => Effect.sync(() => ensured.add(db))),
-        Effect.orDie,
-      )
+      // `admitted` was added after the table shipped; add it to existing tables.
+      // A duplicate-column error on a fresh table is expected and ignored.
+      yield* db
+        .run(sql`ALTER TABLE session_delivery ADD COLUMN admitted INTEGER NOT NULL DEFAULT 0`)
+        .pipe(Effect.catchCause(() => Effect.void))
+      yield* Effect.sync(() => ensured.add(db))
+    }).pipe(Effect.orDie)
   })
 
 export interface Queued {
@@ -48,20 +52,23 @@ export interface Queued {
   readonly body: string
   readonly wake: boolean
   readonly force: boolean
+  // The body was already admitted into the session when the row was written
+  // (a wake marker); draining must only wake, never re-prompt the body.
+  readonly admitted: boolean
 }
 
 export const enqueue = (
   db: DB,
-  input: { sessionID: SessionID; body: string; wake?: boolean; force?: boolean },
+  input: { sessionID: SessionID; body: string; wake?: boolean; force?: boolean; admitted?: boolean },
 ): Effect.Effect<void> =>
   Effect.gen(function* () {
     yield* ensure(db)
     yield* db
       .run(sql`
-        INSERT INTO session_delivery (id, session_id, body, wake, force, created_at)
+        INSERT INTO session_delivery (id, session_id, body, wake, force, admitted, created_at)
         VALUES (
           ${crypto.randomUUID()}, ${input.sessionID}, ${input.body},
-          ${input.wake ? 1 : 0}, ${input.force ? 1 : 0}, ${Date.now()}
+          ${input.wake ? 1 : 0}, ${input.force ? 1 : 0}, ${input.admitted ? 1 : 0}, ${Date.now()}
         )
       `)
       .pipe(Effect.orDie)
@@ -94,19 +101,25 @@ export const claimPending = (
   Effect.gen(function* () {
     yield* ensure(db)
     const rows = yield* db
-      .all<{ rowid: number; id: string; body: string; wake: number; force: number }>(sql`
+      .all<{ rowid: number; id: string; body: string; wake: number; force: number; admitted: number }>(sql`
         UPDATE session_delivery
         SET claimed_at = ${now}, claimed_by = ${owner}
         WHERE delivered_at IS NULL
           AND session_id = ${sessionID}
           AND (claimed_at IS NULL OR claimed_at < ${now - ttl})
-        RETURNING rowid, id, body, wake, force
+        RETURNING rowid, id, body, wake, force, admitted
       `)
       .pipe(Effect.orDie)
     return rows
       .slice()
       .sort((a, b) => a.rowid - b.rowid)
-      .map((row) => ({ id: row.id, body: row.body, wake: row.wake === 1, force: row.force === 1 }))
+      .map((row) => ({
+        id: row.id,
+        body: row.body,
+        wake: row.wake === 1,
+        force: row.force === 1,
+        admitted: row.admitted === 1,
+      }))
   })
 
 export const markDelivered = (db: DB, id: string): Effect.Effect<void> =>

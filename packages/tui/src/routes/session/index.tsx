@@ -298,6 +298,11 @@ export function Session() {
         return
       }
 
+      // Write the freshly fetched session into the store so metadata that
+      // another process changed (partnership, room) is reflected even when this
+      // TUI missed the corresponding event.
+      sync.session.put(result.data)
+
       if (result.data.workspaceID !== previousWorkspace) {
         project.workspace.set(result.data.workspaceID)
 
@@ -323,6 +328,19 @@ export function Session() {
     })
   })
 
+  // Cross-process updates can miss this TUI's event stream (the durable relay
+  // only covers processes sharing one database). An open room is reconciled
+  // periodically so it keeps updating even without events. Restricted to rooms
+  // so it never races a streaming agent turn in a normal session.
+  createEffect(() => {
+    const sessionID = route.sessionID
+    if (sync.session.get(sessionID)?.metadata?.isRoom !== true) return
+    const timer = setInterval(() => {
+      void sync.session.pollMessages(sessionID)
+    }, 2000)
+    onCleanup(() => clearInterval(timer))
+  })
+
   let lastSwitch: string | undefined = undefined
   event.on("message.part.updated", (evt) => {
     const part = evt.properties.part
@@ -330,7 +348,6 @@ export function Session() {
     if (part.sessionID !== route.sessionID) return
     if (part.state.status !== "completed") return
     if (part.id === lastSwitch) return
-
     if (part.tool === "plan_exit") {
       local.agent.set("build")
       lastSwitch = part.id

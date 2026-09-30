@@ -158,6 +158,26 @@ describe("session.message-v2.toModelMessage", () => {
     expect(await MessageV2.toModelMessages(input, model)).toStrictEqual([])
   })
 
+  test("filters out assistant messages with only ignored parts", async () => {
+    const messageID = "m-assistant"
+
+    const input: SessionV1.WithParts[] = [
+      {
+        info: assistantInfo(messageID, "m-parent"),
+        parts: [
+          {
+            ...basePart(messageID, "p1"),
+            type: "text",
+            text: "Message posted.",
+            ignored: true,
+          },
+        ] as SessionV1.Part[],
+      },
+    ]
+
+    expect(await MessageV2.toModelMessages(input, model)).toStrictEqual([])
+  })
+
   test("filters out user messages with only empty text parts", async () => {
     const messageID = "m-user"
 

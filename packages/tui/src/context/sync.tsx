@@ -28,7 +28,7 @@ import { useTuiStartup } from "./runtime"
 import { createSimpleContext } from "./helper"
 import { useExit } from "./exit"
 import { useArgs } from "./args"
-import { batch, onMount } from "solid-js"
+import { batch, onCleanup, onMount } from "solid-js"
 import path from "path"
 import { useKV } from "./kv"
 import { usePermission } from "./permission"
@@ -553,6 +553,16 @@ export const {
 
     onMount(() => {
       void bootstrap()
+      // Live events carry same-process changes, but a session changed by another
+      // process only reaches this TUI through the event relay, which can miss
+      // updates. Reconcile the session list from the server periodically so the
+      // UI always reflects real partnership/room membership.
+      const timer = setInterval(() => {
+        void listSessions()
+          .then((list) => setStore("session", reconcile(list)))
+          .catch(() => {})
+      }, 5000)
+      onCleanup(() => clearInterval(timer))
     })
 
     const result = {
@@ -574,6 +584,20 @@ export const {
           if (match.found) return store.session[match.index]
           return undefined
         },
+        // Upsert a session fetched directly from the server. Live events are the
+        // primary update path, but a session changed by another process can miss
+        // this one's event stream; writing the freshly fetched info on open keeps
+        // metadata (partnership, room) accurate regardless.
+        put(info: Session) {
+          setStore(
+            "session",
+            produce((draft) => {
+              const match = search(draft, info.id, (s) => s.id)
+              if (match.found) draft[match.index] = info
+              else draft.splice(match.index, 0, info)
+            }),
+          )
+        },
         query() {
           return sessionListQuery()
         },
@@ -591,8 +615,27 @@ export const {
           if (last.role === "user") return "working"
           return last.time.completed ? "idle" : "working"
         },
-        async sync(sessionID: string) {
-          if (fullSyncedSessions.has(sessionID)) return
+        // Whether the session has an assistant turn in flight. Derived from the
+        // durable message stream, so it also reflects a session another process
+        // is running (whose in-memory `session.status` never reaches this TUI).
+        working(sessionID: string) {
+          const messages = store.message[sessionID] ?? []
+          const last = messages.at(-1)
+          return !!last && last.role === "assistant" && !last.time.completed
+        },
+        // Poll for new messages, but only re-sync when the newest message id
+        // actually changed. Re-assigning `message[sessionID]` on every tick
+        // re-renders the whole list, which shows up as flicker.
+        async pollMessages(sessionID: string) {
+          const current = store.message[sessionID] ?? []
+          const last = current.at(-1)?.id
+          const res = await sdk.client.session.messages({ sessionID, limit: 100 }).catch(() => undefined)
+          const newest = res?.data?.at(-1)?.info?.id
+          if (last !== undefined && newest !== undefined && last === newest) return
+          await this.sync(sessionID, true).catch(() => {})
+        },
+        async sync(sessionID: string, force = false) {
+          if (!force && fullSyncedSessions.has(sessionID)) return
           const syncing = syncingSessions.get(sessionID)
           if (syncing) return syncing
           const tracker = { messages: new Set<string>(), parts: new Set<string>() }

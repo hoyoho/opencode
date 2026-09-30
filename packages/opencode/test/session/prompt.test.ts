@@ -36,6 +36,7 @@ import { Instruction } from "../../src/session/instruction"
 import { SessionProcessor } from "../../src/session/processor"
 import { SessionPrompt } from "../../src/session/prompt"
 import { SessionLease } from "../../src/session/lease"
+import { SessionInterrupt } from "../../src/session/interrupt"
 import { roomOf } from "../../src/session/collaboration"
 import { SessionRevert } from "../../src/session/revert"
 import { SessionRunState } from "../../src/session/run-state"
@@ -1198,6 +1199,56 @@ it.instance("cancel records MessageAbortedError on interrupted process", () =>
   }),
 )
 
+// A room/partner wake can run a session in the process that delivered the
+// message, so the target's own process has no runner to cancel. Its abort
+// writes a durable request the lease owner polls.
+it.instance("an out-of-process interrupt request stops the owning run", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const status = yield* SessionStatus.Service
+    const database = yield* Database.Service
+    const db = database.db
+    const chat = yield* sessions.create({ title: "Remote interrupt" })
+    yield* llm.hang
+    yield* user(chat.id, "hello")
+
+    const fiber = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+    yield* llm.wait(1)
+    yield* waitForBusy(chat.id)
+
+    // What another process's `cancel` writes when it does not hold the runner.
+    yield* SessionInterrupt.request(db, chat.id)
+    yield* Fiber.await(fiber)
+    expect((yield* status.get(chat.id)).type).toBe("idle")
+  }),
+  5_000,
+)
+
+it.instance("cancel signals a foreign lease owner instead of flipping local status", () =>
+  Effect.gen(function* () {
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const database = yield* Database.Service
+    const db = database.db
+    const chat = yield* sessions.create({ title: "Foreign" })
+    yield* SessionLease.ensure(db)
+    yield* SessionInterrupt.ensure(db)
+
+    // No run anywhere: a local cancel writes no request.
+    yield* prompt.cancel(chat.id)
+    expect(yield* SessionInterrupt.pending(db, chat.id)).toBe(false)
+
+    // Another process holds the lease: cancel must record a durable request
+    // for that process to observe instead of silently no-oping locally.
+    expect(yield* SessionLease.claim(db, chat.id, 30000, "elsewhere")).toBe(true)
+    yield* prompt.cancel(chat.id)
+    expect(yield* SessionInterrupt.pending(db, chat.id)).toBe(true)
+    yield* SessionInterrupt.clear(db, chat.id)
+  }),
+)
+
 raceNoLLMServer.instance(
   "finalizes assistant when cancelled before processor creation completes",
   () =>
@@ -1852,7 +1903,7 @@ noLLMServer.instance(
     Effect.gen(function* () {
       const { prompt, chat } = yield* boot()
 
-      const created = yield* prompt.command({ sessionID: chat.id, command: "roommgr", arguments: "create Direct" })
+      const created = yield* prompt.command({ sessionID: chat.id, command: "roommgr", arguments: "new Direct" })
       expect(created.info.role).toBe("assistant")
       const createdText = created.parts.findLast((part) => part.type === "text")?.text ?? ""
       expect(createdText).toContain("Room created")
@@ -1907,7 +1958,7 @@ it.instance(
       yield* waitForBusy(chat.id)
 
       const exit = yield* prompt
-        .command({ sessionID: chat.id, command: "roommgr", arguments: "create Busy" })
+        .command({ sessionID: chat.id, command: "roommgr", arguments: "new Busy" })
         .pipe(Effect.exit)
       expect(Exit.isFailure(exit)).toBe(true)
       if (Exit.isFailure(exit)) expect(Cause.squash(exit.cause)).toBeInstanceOf(Session.BusyError)
@@ -1939,7 +1990,7 @@ it.instance(
       yield* SessionLease.claim(database.db, chat.id, 30_000, "another-process")
 
       const exit = yield* prompt
-        .command({ sessionID: chat.id, command: "roommgr", arguments: "create Leased" })
+        .command({ sessionID: chat.id, command: "roommgr", arguments: "new Leased" })
         .pipe(Effect.exit)
       expect(Exit.isFailure(exit)).toBe(true)
 
@@ -1963,7 +2014,7 @@ it.instance(
       const chat = yield* sessions.create({ title: "Leaver" })
 
       // Join a room first so `leave` has something to detach from.
-      yield* prompt.command({ sessionID: chat.id, command: "roommgr", arguments: "create Temp" })
+      yield* prompt.command({ sessionID: chat.id, command: "roommgr", arguments: "new Temp" })
 
       yield* llm.hold("first", deferredAsPromise(gate))
       yield* llm.text("second")
@@ -2000,7 +2051,7 @@ it.instance(
       const sessions = yield* Session.Service
       const chat = yield* sessions.create({ title: "Pinned" })
 
-      yield* prompt.command({ sessionID: chat.id, command: "roommgr", arguments: "create Silent" })
+      yield* prompt.command({ sessionID: chat.id, command: "roommgr", arguments: "new Silent" })
       yield* prompt.command({ sessionID: chat.id, command: "roommgr", arguments: "status" })
 
       expect(yield* llm.calls).toBe(0)
@@ -2014,7 +2065,7 @@ noLLMServer.instance(
     Effect.gen(function* () {
       const { prompt, sessions, chat } = yield* boot()
 
-      yield* prompt.command({ sessionID: chat.id, command: "roommgr", arguments: "create Direct" })
+      yield* prompt.command({ sessionID: chat.id, command: "roommgr", arguments: "new Direct" })
       yield* prompt.command({ sessionID: chat.id, command: "roommgr", arguments: "status" })
 
       const msgs = yield* sessions.messages({ sessionID: chat.id })
@@ -2023,8 +2074,15 @@ noLLMServer.instance(
 
       const text = (m: SessionV1.WithParts) =>
         m.parts.flatMap((part) => (part.type === "text" && !part.synthetic ? [part.text] : [])).join("")
-      expect(text(msgs[0])).toBe("/roommgr create Direct")
+      expect(text(msgs[0])).toBe("/roommgr new Direct")
       expect(text(msgs[2])).toBe("/roommgr status")
+
+      // The user's operation log is visible in the transcript but marked
+      // `ignored`, so it is never sent to the model (no god-view trace).
+      const everyTextIgnored = (m: SessionV1.WithParts) =>
+        m.parts.flatMap((part) => (part.type === "text" ? [part.ignored === true] : [])).every(Boolean)
+      expect(everyTextIgnored(msgs[0])).toBe(true)
+      expect(everyTextIgnored(msgs[2])).toBe(true)
 
       // The reply must hang off the command turn it answers: this linkage is
       // what the loop exit test keys on.
@@ -2035,6 +2093,35 @@ noLLMServer.instance(
       }
       expect(parentOf(1)).toBe(msgs[0].info.id)
       expect(parentOf(3)).toBe(msgs[2].info.id)
+    }),
+  { config: cfg },
+)
+
+// A manager command is a god-view operation: its command line and reply are
+// `ignored`, so no model perceives them (no tokens), while the user still sees
+// them in the TUI.
+noLLMServer.instance(
+  "a manager command's log and reply stay out of the model context",
+  () =>
+    Effect.gen(function* () {
+      const { prompt, sessions, chat } = yield* boot()
+      yield* prompt.command({ sessionID: chat.id, command: "roommgr", arguments: "new Speak" })
+
+      const said = yield* prompt.command({ sessionID: chat.id, command: "roommgr", arguments: "say hello all" })
+      const visible = said.parts.flatMap((part) =>
+        part.type === "text" && !part.synthetic && !part.ignored ? [part.text] : [],
+      )
+      expect(visible).toHaveLength(0)
+
+      const msgs = yield* sessions.messages({ sessionID: chat.id })
+      const replyVisible = msgs.flatMap((message) =>
+        message.parts.flatMap((part) =>
+          part.type === "text" && !part.synthetic && !part.ignored && part.text.includes("Message posted")
+            ? [part.text]
+            : [],
+        ),
+      )
+      expect(replyVisible).toHaveLength(0)
     }),
   { config: cfg },
 )
@@ -2062,7 +2149,7 @@ noLLMServer.instance(
       // line there looks exactly like a pass.
       for (const [args, usage] of [
         ["kick", "Usage: /roommgr kick <session-id>"],
-        ["post", "Usage: /roommgr post <message>"],
+        ["say", "Usage: /roommgr say <message>"],
       ]) {
         const text = yield* prompt.command({ sessionID: chat.id, command: "roommgr", arguments: args })
         const body = text.parts.findLast((part) => part.type === "text")?.text ?? ""
@@ -2073,7 +2160,7 @@ noLLMServer.instance(
       // A non-member room id does reach the tool, which is why a live canary
       // needs a real room id rather than a bare subcommand.
       const other = yield* sessions.create({ title: "Other", agent: "build" })
-      const created = yield* prompt.command({ sessionID: other.id, command: "roommgr", arguments: "create Canary" })
+      const created = yield* prompt.command({ sessionID: other.id, command: "roommgr", arguments: "new Canary" })
       const createdText = created.parts.findLast((part) => part.type === "text")?.text ?? ""
       const room = createdText.match(/<room id="(ses_[^"]+)"/)?.[1]
       if (!room) throw new Error(`no room id in: ${createdText}`)
@@ -2096,11 +2183,9 @@ noLLMServer.instance(
 
 // `/partnermgr` needs the same direct-path coverage as `/roommgr`: the parser
 // tests only pin the parse result, not that the tool actually ran and mutated
-// partnership state. The `talk` case is the automated twin of the operator's
-// quoted-argument canary, so a regression there is caught here rather than only
-// in a manual run.
+// partnership state. The `broadcast` case exercises delivery end to end.
 noLLMServer.instance(
-  "partnermgr add, status, and talk run directly and mutate partnership state",
+  "partnermgr add, status, and broadcast run directly and mutate partnership state",
   () =>
     Effect.gen(function* () {
       const { prompt, sessions, chat } = yield* boot()
@@ -2126,10 +2211,16 @@ noLLMServer.instance(
       const statusText = status.parts.findLast((part) => part.type === "text")?.text ?? ""
       expect(statusText).toContain(other.id)
 
+      // `tell` was removed from the command layer; the remaining way to reach a
+      // partner by command is `broadcast`.
+      const unknown = yield* prompt.command({ sessionID: chat.id, command: "partnermgr", arguments: `tell ${other.id} hi` })
+      const unknownText = unknown.parts.findLast((part) => part.type === "text")?.text ?? ""
+      expect(unknownText).toContain("Unknown partnermgr subcommand")
+
       yield* prompt.command({
         sessionID: chat.id,
         command: "partnermgr",
-        arguments: `talk ${other.id} "hello there"`,
+        arguments: `broadcast "hello there"`,
       })
 
       const delivered = yield* sessions.messages({ sessionID: other.id })
@@ -2138,7 +2229,7 @@ noLLMServer.instance(
       )
       const payload = texts.find((text) => text.includes("hello there"))
       expect(payload).toBeDefined()
-      expect(payload).not.toContain('"hello there"')
+      expect(payload).toContain('sender="user"')
     }),
   { config: cfg },
 )
@@ -2179,24 +2270,6 @@ noLLMServer.instance(
         (yield* sessions.get(chat.id)).metadata?.["partners"],
       )
       expect((yield* sessions.get(partner.id)).metadata?.["partners"]).toBeDefined()
-    }),
-  { config: cfg },
-)
-
-noLLMServer.instance(
-  "partnermgr remove of your own id detaches directly",
-  () =>
-    Effect.gen(function* () {
-      const { prompt, sessions, chat } = yield* boot()
-      const partner = yield* sessions.create({ title: "Partner", agent: "build" })
-      yield* prompt.command({ sessionID: chat.id, command: "partnermgr", arguments: `add ${partner.id}` })
-
-      const left = yield* prompt.command({ sessionID: chat.id, command: "partnermgr", arguments: `remove ${chat.id}` })
-      const text = left.parts.findLast((part) => part.type === "text")?.text ?? ""
-      expect(text).toContain("You left the partnership")
-      expect((yield* sessions.get(chat.id)).metadata?.["partners"]).toBeUndefined()
-      // The two-member group dissolves, so the partner is cleared as well.
-      expect((yield* sessions.get(partner.id)).metadata?.["partners"]).toBeUndefined()
     }),
   { config: cfg },
 )

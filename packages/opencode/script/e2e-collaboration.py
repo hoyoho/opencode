@@ -3,7 +3,7 @@
 
 Drives the real server over its HTTP API (the same API the web UI uses), which
 is how the feature is exercised in practice. Covers room lifecycle, paging,
-delivery semantics, deferred delivery + wake, manager commands, partnerships,
+delivery semantics, immediate queueing + wake, manager commands, partnerships,
 and cross-process behaviour.
 
 Two server processes sharing one database are started automatically (needed for
@@ -172,12 +172,11 @@ def run():
     d1, d2 = new_session(A), new_session(A)
     cmd(A, d1, "roommgr", "create DestroyMe"); dr = room_of(A, d1)
     cmd(A, d2, "roommgr", f"join {dr}")
-    check("D01", "destroy with others present refused", "still has 1 other member" in cmd(A, d1, "roommgr", "destroy"))
-    cmd(A, d2, "roommgr", "leave")
     t = cmd(A, d1, "roommgr", "destroy")
     info = get(A, f"/session/{dr}?directory={D}")
-    check("D02", "destroy as last member works + archived", 'state="destroyed"' in t
+    check("D01", "destroy with others present clears + archives", 'state="destroyed"' in t and room_of(A, d2) is None
           and (info.get("metadata") or {}).get("room_state") == "destroyed" and (info.get("time") or {}).get("archived"))
+    check("D02", "destroy clears the caller too", room_of(A, d1) is None)
     check("D03", "destroy again refused", "already destroyed" in cmd(A, d1, "roommgr", f"destroy {dr}"))
     e1, e2 = new_session(A), new_session(A)
     cmd(A, e1, "roommgr", "create LiveRoom"); er = room_of(A, e1)
@@ -205,7 +204,7 @@ def run():
     check("P03", "backward paging works", ("m1" in bw) or ("m2" in bw), bw[:150])
     check("P04", "non-numeric limit token ignored (default read)", "m5" in cmd(A, p1, "roommgr", f"read {pr} -5"))
     skip = cmd(A, p1, "roommgr", f"read {pr} 100 skip_events")
-    check("P05", "skip_events hides events", "<room_event" not in skip and "m5" in skip, skip[:150])
+    check("P05", "skip_events token dropped (events shown)", "<room_event" in skip and "m5" in skip, skip[:150])
 
     # ===== X: delivery semantics =====
     xx = new_session(A); cmd(A, xx, "roommgr", "create DeliveryRoom"); xr = room_of(A, xx)
@@ -227,16 +226,16 @@ def run():
     start_shell(A, f2, "sleep 14"); time.sleep(3)
     check("F01", "shell -> busy", (status_of(A, f2) or {}).get("type") == "busy", status_of(A, f2))
     cmd(A, f1, "roommgr", "post during-sleep"); time.sleep(2)
-    check("F02", "busy member not injected", count(A, f2, "during-sleep") == 0)
+    check("F02", "busy member sees queued message immediately", count(A, f2, "during-sleep") >= 1)
     time.sleep(14)
-    check("F03", "flushed after idle", count(A, f2, "during-sleep") >= 1)
+    check("F03", "still present after idle", count(A, f2, "during-sleep") >= 1)
 
     # ===== M: manager commands =====
     m1 = new_session(A)
     check("M01", "runs directly (no model)", "Room created" in cmd(A, m1, "roommgr", "create M"))
-    check("M02", "old alias /roommgr new rejected", "Unknown roommgr subcommand: new" in cmd(A, m1, "roommgr", "new X"))
-    check("M03", "post ok / say rejected", "Message posted" in cmd(A, m1, "roommgr", "post hi")
-          and "Unknown roommgr subcommand: say" in cmd(A, m1, "roommgr", "say hi"))
+    check("M02", "new alias creates a room", "Room created" in cmd(A, m1, "roommgr", "new X"))
+    check("M03", "say and post both post", "Message posted" in cmd(A, m1, "roommgr", "say hi")
+          and "Message posted" in cmd(A, m1, "roommgr", "post hi"))
     nb = len(msgs(A, m1)); cmd(A, m1, "roommgr", "status"); na = len(msgs(A, m1))
     check("M04", "records user+assistant pair", na - nb == 2 and (msgs(A, m1)[nb]["info"]["role"] == "user"), (nb, na))
     mb = new_session(A); cmd(A, mb, "roommgr", "create BusyRoom")
@@ -248,10 +247,10 @@ def run():
     time.sleep(2)
     mm, mm2 = new_session(A), new_session(A)
     cmd(A, mm, "partnermgr", f"add {mm2}")
-    check("M06", "partnermgr talk ok / tell rejected", 'state="delivered"' in cmd(A, mm, "partnermgr", f"talk {mm2} hi")
-          and "Unknown partnermgr subcommand: tell" in cmd(A, mm, "partnermgr", f"tell {mm2} hi"))
-    check("M07", "leave rejected / remove self detaches", "Unknown partnermgr subcommand: leave" in cmd(A, mm, "partnermgr", "leave")
-          and "You left the partnership" in cmd(A, mm, "partnermgr", f"remove {mm}"))
+    check("M06", "tell delivers / talk rejected", 'state="delivered"' in cmd(A, mm, "partnermgr", f"tell {mm2} hi")
+          and "Unknown partnermgr subcommand: talk" in cmd(A, mm, "partnermgr", f"talk {mm2} hi"))
+    check("M07", "leave works / remove self refused", "You left the partnership" in cmd(A, mm, "partnermgr", "leave")
+          and "use partner leave" in cmd(A, mm, "partnermgr", f"remove {mm}"))
 
     # ===== N: partner =====
     n1, n2 = new_session(A), new_session(A)
@@ -272,9 +271,9 @@ def run():
     check("N08", "remove non-partner refused", "not in a partnership" in cmd(A, n3, "partnermgr", f"remove {new_session(A)}"))
     q1, q2, q3 = new_session(A), new_session(A), new_session(A)
     cmd(A, q1, "partnermgr", f"add {q2}"); cmd(A, q1, "partnermgr", f"add {q3}")
-    tk = cmd(A, q1, "partnermgr", f"talk {q2} hello")
-    check("N09", "talk to partner delivered", 'state="delivered"' in tk and 'relation="partner"' in tk, tk[:150])
-    check("N10", "talk to unrelated refused", "not a related agent" in cmd(A, new_session(A), "partnermgr", f"talk {new_session(A)} hey"))
+    tk = cmd(A, q1, "partnermgr", f"tell {q2} hello")
+    check("N09", "tell to partner delivered", 'state="delivered"' in tk and 'relation="partner"' in tk, tk[:150])
+    check("N10", "tell to unrelated refused", "not a related agent" in cmd(A, new_session(A), "partnermgr", f"tell {new_session(A)} hey"))
     check("N11", "broadcast reaches partners", "Broadcast delivered to 2 partners" in cmd(A, q1, "partnermgr", "broadcast everyone"))
     check("N12", "status lists partnership", "count=" in cmd(A, q1, "partnermgr", "status"))
 
@@ -292,9 +291,9 @@ def run():
     cmd(A, cr2, "roommgr", f"join {crr}")
     start_shell(A, cr2, "sleep 14"); time.sleep(3)
     cmd(B, cr1, "roommgr", "post cross-defer"); time.sleep(2)
-    check("C03", "cross-process busy: no injection", count(A, cr2, "cross-defer") == 0)
+    check("C03", "cross-process busy: queued immediately", count(A, cr2, "cross-defer") >= 1)
     time.sleep(14)
-    check("C03b", "cross-process idle flush", count(A, cr2, "cross-defer") >= 1)
+    check("C03b", "cross-process idle: still present", count(A, cr2, "cross-defer") >= 1)
 
     passed = sum(1 for r in RESULTS if r[2]); total = len(RESULTS)
     print("\n===== SUMMARY %d/%d =====" % (passed, total))

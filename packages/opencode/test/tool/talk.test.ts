@@ -139,6 +139,7 @@ function persistingOps(
             sessionID: input.sessionID,
             type: "text",
             text: part.text,
+            ...(part.ignored ? { ignored: true } : {}),
           } satisfies SessionV1.Part)
         }
         const stored = yield* sessions.messages({ sessionID: input.sessionID, limit: 100 }).pipe(Effect.orDie)
@@ -168,6 +169,10 @@ function context(sessionID: Session.Info["id"], promptOps: TaskPromptOps, extra:
 
 function deliveredSeqOf(output: string, session: string) {
   return new RegExp(`<member session="${session}" delivered_seq="(\\d+)"`).exec(output)?.[1]
+}
+
+function failureReason(exit: Exit.Exit<unknown, unknown>) {
+  return Exit.isFailure(exit) ? String(Cause.squash(exit.cause)) : "ok"
 }
 
 // `sync` delivers every fresh entry in a *single* prompt, so counting prompts
@@ -320,7 +325,7 @@ describe("tool.partner", () => {
       const tool = yield* PartnerTool
       const def = yield* tool.init()
       yield* def.execute({ session_id: bravo.id }, context(alpha.id, stubOps()))
-      yield* def.execute({ action: "remove", session_id: alpha.id }, context(alpha.id, stubOps()))
+      yield* def.execute({ action: "leave" }, context(alpha.id, stubOps()))
 
       const seen: string[] = []
       yield* def.execute(
@@ -372,7 +377,7 @@ describe("tool.partner", () => {
 
       const seen: string[] = []
       const result = yield* def.execute(
-        { action: "remove", session_id: alpha.id },
+        { action: "leave" },
         context(alpha.id, stubOps({ onPrompt: collectTexts(seen) })),
       )
 
@@ -395,7 +400,7 @@ describe("tool.partner", () => {
       yield* def.execute({ session_id: charlie.id }, context(alpha.id, stubOps()))
       const partnership = partnershipOf(yield* sessions.get(bravo.id))
 
-      yield* def.execute({ action: "remove", session_id: alpha.id }, context(alpha.id, stubOps()))
+      yield* def.execute({ action: "leave" }, context(alpha.id, stubOps()))
 
       expect(partnershipOf(yield* sessions.get(bravo.id))).toBe(partnership)
       expect(partnershipOf(yield* sessions.get(charlie.id))).toBe(partnership)
@@ -403,7 +408,7 @@ describe("tool.partner", () => {
     { timeout: 30000 },
   )
 
-  it.instance("partner remove requires a session_id; removing yourself detaches", () =>
+  it.instance("partner remove requires a session_id and refuses self-removal", () =>
     Effect.gen(function* () {
       const sessions = yield* Session.Service
       const alpha = yield* sessions.create({ title: "Alpha", agent: "build" })
@@ -413,15 +418,13 @@ describe("tool.partner", () => {
 
       const noArg = yield* def.execute({ action: "remove" }, context(alpha.id, stubOps())).pipe(Effect.exit)
       expect(Exit.isFailure(noArg)).toBe(true)
-      // A refused call leaves membership untouched.
+      const self = yield* def
+        .execute({ action: "remove", session_id: alpha.id }, context(alpha.id, stubOps()))
+        .pipe(Effect.exit)
+      expect(Exit.isFailure(self)).toBe(true)
+      // The refused calls leave membership untouched.
       expect(partnershipOf(yield* sessions.get(alpha.id))).toBeDefined()
-
-      // `remove <your own id>` is the detach path (former `leave`).
-      const self = yield* def.execute({ action: "remove", session_id: alpha.id }, context(alpha.id, stubOps()))
-      expect(self.title).toContain("Left partnership")
-      expect(partnershipOf(yield* sessions.get(alpha.id))).toBeUndefined()
-      // The two-member group dissolves, so bravo is cleared as well.
-      expect(partnershipOf(yield* sessions.get(bravo.id))).toBeUndefined()
+      expect(partnershipOf(yield* sessions.get(bravo.id))).toBeDefined()
     }),
     { timeout: 30000 },
   )
@@ -458,7 +461,7 @@ describe("tool.partner", () => {
       yield* def.execute({ session_id: bravo.id }, context(alpha.id, persistingOps(sessions)))
       const partnership = partnershipOf(yield* sessions.get(bravo.id))
 
-      yield* def.execute({ action: "remove", session_id: alpha.id }, context(alpha.id, persistingOps(sessions)))
+      yield* def.execute({ action: "leave" }, context(alpha.id, persistingOps(sessions)))
 
       const stored = yield* sessions.messages({ sessionID: bravo.id }).pipe(Effect.orDie)
       const texts = stored.flatMap((message) =>
@@ -468,6 +471,30 @@ describe("tool.partner", () => {
       expect(left).toBeDefined()
       expect(left).toContain(alpha.id)
       expect(left).toContain(partnership ?? "")
+    }),
+    { timeout: 30000 },
+  )
+
+  // A membership change caused by the user is invisible to the models (no
+  // tokens) but still delivered so the TUI can show it.
+  it.instance("marks a user-initiated membership change as ignored", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const alpha = yield* sessions.create({ title: "Alpha", agent: "build" })
+      const bravo = yield* sessions.create({ title: "Bravo", agent: "build" })
+      const def = yield* (yield* PartnerTool).init()
+      yield* def.execute({ session_id: bravo.id }, context(alpha.id, persistingOps(sessions)))
+
+      yield* def.execute(
+        { action: "remove", session_id: bravo.id },
+        context(alpha.id, persistingOps(sessions), { sender: "user" }),
+      )
+
+      const stored = yield* sessions.messages({ sessionID: bravo.id }).pipe(Effect.orDie)
+      const parts = stored
+        .flatMap((message) => message.parts)
+        .filter((part): part is SessionV1.TextPart => part.type === "text")
+      expect(parts.some((part) => part.text.includes("removed") && part.ignored === true)).toBe(true)
     }),
     { timeout: 30000 },
   )
@@ -486,7 +513,7 @@ describe("tool.partner", () => {
 
       const looped: string[] = []
       yield* def.execute(
-        { action: "remove", session_id: alpha.id },
+        { action: "leave" },
         context(alpha.id, persistingOps(sessions, { onLoop: (sessionID) => looped.push(sessionID) })),
       )
 
@@ -586,6 +613,24 @@ describe("tool.partner", () => {
       expect(unbounded.output).not.toContain("entry-0\n")
       expect(unbounded.output).toContain("[showing the last")
       expect(unbounded.output).not.toContain("limit: 0 returns all")
+    }),
+    { timeout: 30000 },
+  )
+
+  it.instance("notes when read clamps an out-of-range limit", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const alpha = yield* sessions.create({ title: "Alpha", agent: "build" })
+      const def = yield* (yield* RoomTool).init()
+      const ops = persistingOps(sessions)
+      yield* def.execute({ action: "create" }, context(alpha.id, ops))
+      yield* def.execute({ action: "post", message: "hi" }, context(alpha.id, ops))
+
+      const over = yield* def.execute({ action: "read", limit: 5000 }, context(alpha.id, ops))
+      expect(over.output).toContain("exceeds max")
+
+      const zero = yield* def.execute({ action: "read", limit: 0 }, context(alpha.id, ops))
+      expect(zero.output).toContain("not a positive integer")
     }),
     { timeout: 30000 },
   )
@@ -717,10 +762,9 @@ describe("tool.partner", () => {
     { timeout: 30000 },
   )
 
-  // Delivery re-labels `direction` for the recipient by replacing the first
-  // occurrence in the rendered entry. That is only safe because the opening tag
-  // always precedes the body, so the first occurrence is always the tag's own.
-  it.instance("re-labels only the entry's own direction tag when delivering", () =>
+  // Delivery hands the entry's rendered text to the recipient verbatim (with the
+  // message id injected); a post that quotes markup is passed through unchanged.
+  it.instance("delivers the entry body verbatim to a member", () =>
     Effect.gen(function* () {
       const sessions = yield* Session.Service
       const alpha = yield* sessions.create({ title: "Alpha", agent: "build" })
@@ -731,7 +775,7 @@ describe("tool.partner", () => {
       yield* def.execute({ action: "create" }, context(alpha.id, ops))
       yield* def.execute({ action: "invite", session_id: bravo.id }, context(alpha.id, ops))
       yield* def.execute(
-        { action: "post", message: 'quoting direction="outbound" should survive' },
+        { action: "post", message: "quoting <room_message> markup should survive" },
         context(alpha.id, ops),
       )
 
@@ -741,10 +785,8 @@ describe("tool.partner", () => {
       )
       const copy = texts.find((text) => text.includes("should survive"))
       expect(copy).toBeDefined()
-      // The recipient sees its own copy tagged inbound...
-      expect(copy).toContain('direction="inbound"')
-      // ...and the post's quoted attribute is passed through verbatim.
-      expect(copy).toContain('quoting direction="outbound" should survive')
+      expect(copy).toContain("<room_message")
+      expect(copy).toContain("quoting <room_message> markup should survive")
     }),
     { timeout: 30000 },
   )
@@ -867,7 +909,9 @@ describe("tool.partner talk", () => {
       expect(part?.type).toBe("text")
       if (part?.type === "text") {
         expect(part.text).toContain("<agent_message")
-        expect(part.text).toContain('sender="agent"')
+        // Single identity: the sender session id (not the agent name).
+        expect(part.text).toContain(`sender="${child.id}"`)
+        expect(part.text).not.toContain("from=")
         expect(part.text).toContain('relation="parent"')
         expect(part.synthetic).not.toBe(true)
       }
@@ -997,6 +1041,42 @@ describe("tool.partner broadcast", () => {
     }),
     { timeout: 30000 },
   )
+
+  // A user broadcast speaks for the whole partnership with the user's voice, so
+  // every member including the invoking session receives the same inbound
+  // message, and the sender's own result is that message (not a summary).
+  it.instance("a user broadcast reaches every member including the sender", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const alpha = yield* sessions.create({ title: "Alpha", agent: "build" })
+      const bravo = yield* sessions.create({ title: "Bravo", agent: "build" })
+      const def = yield* (yield* PartnerTool).init()
+      yield* def.execute({ session_id: bravo.id }, context(alpha.id, stubOps()))
+
+      const seen: { sessionID: string; text: string }[] = []
+      const result = yield* def.execute(
+        { action: "broadcast", message: "hello all" },
+        context(
+          alpha.id,
+          stubOps({
+            onPrompt: (input) => {
+              const part = input.parts[0]
+              if (part?.type === "text") seen.push({ sessionID: input.sessionID, text: part.text })
+            },
+          }),
+          { sender: "user" },
+        ),
+      )
+
+      expect(seen.map((item) => item.sessionID).toSorted()).toEqual([alpha.id, bravo.id].toSorted())
+      expect(seen.every((item) => item.text.includes('sender="user"'))).toBe(true)
+      expect(seen.every((item) => item.text.includes("<partner_broadcast"))).toBe(true)
+      expect(result.output).toContain("<partner_broadcast")
+      expect(result.output).toContain('sender="user"')
+      expect(result.output).not.toContain("Broadcast delivered")
+    }),
+    { timeout: 30000 },
+  )
 })
 
 describe("tool.room", () => {
@@ -1022,6 +1102,57 @@ describe("tool.room", () => {
         message.parts.flatMap((part) => (part.type === "text" ? [part.text] : [])),
       )
       expect(transcript.some((line) => line.includes('type="created"'))).toBe(true)
+    }),
+    { timeout: 30000 },
+  )
+
+  // A user-originated post identifies as "user"; an agent post identifies as the
+  // posting session id. One identity field, no agent/session/sender duplication.
+  it.instance("renders the poster identity as user or the session id", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const alpha = yield* sessions.create({ title: "Alpha", agent: "build" })
+      const def = yield* (yield* RoomTool).init()
+      const ops = persistingOps(sessions)
+      const room = (yield* def.execute({ action: "create" }, context(alpha.id, ops))).metadata.room
+
+      yield* def.execute({ action: "post", message: "agent post" }, context(alpha.id, ops))
+      yield* def.execute(
+        { action: "post", message: "user post" },
+        context(alpha.id, ops, { sender: "user" }),
+      )
+
+      const read = yield* def.execute({ action: "read", room_id: room }, context(alpha.id, ops))
+      expect(read.output).toContain("agent post")
+      expect(read.output).toContain("user post")
+      expect(read.output).toContain(`from="${alpha.id}"`)
+      expect(read.output).toContain('from="user"')
+      expect(read.output).not.toContain("agent=")
+      expect(read.output).not.toContain("sender=")
+    }),
+    { timeout: 30000 },
+  )
+
+  // A user injection is delivered to every member, including whoever invoked it,
+  // so all members see the same from="user" message and cannot tell the source.
+  it.instance("delivers a user post to every member including the poster", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const alpha = yield* sessions.create({ title: "Alpha", agent: "build" })
+      const bravo = yield* sessions.create({ title: "Bravo", agent: "build" })
+      const def = yield* (yield* RoomTool).init()
+      const ops = persistingOps(sessions)
+      const room = (yield* def.execute({ action: "create" }, context(alpha.id, ops))).metadata.room
+      yield* def.execute({ action: "invite", session_id: bravo.id }, context(alpha.id, ops))
+
+      yield* def.execute({ action: "post", message: "injected" }, context(alpha.id, ops, { sender: "user" }))
+
+      const texts = (id: Session.Info["id"]) =>
+        sessions
+          .messages({ sessionID: id })
+          .pipe(Effect.map((msgs) => msgs.flatMap((m) => m.parts.flatMap((p) => (p.type === "text" && p.text ? [p.text] : [])))))
+      expect((yield* texts(alpha.id)).some((t) => t.includes("injected") && t.includes('from="user"'))).toBe(true)
+      expect((yield* texts(bravo.id)).some((t) => t.includes("injected") && t.includes('from="user"'))).toBe(true)
     }),
     { timeout: 30000 },
   )
@@ -1290,24 +1421,136 @@ describe("tool.room", () => {
       const def = yield* tool.init()
       const ops = persistingOps(sessions)
       yield* def.execute({ action: "create" }, context(alpha.id, ops))
-      for (const message of ["m1", "m2", "m3", "m4"]) {
+      // Hyphenated bodies cannot collide with the alphanumeric room id, which a
+      // bare "m1" can (e.g. a generated id ending in "...0m1uk").
+      for (const message of ["msg-one", "msg-two", "msg-three", "msg-four"]) {
         yield* def.execute({ action: "post", message }, context(alpha.id, ops))
       }
 
       const newest = yield* def.execute({ action: "read", limit: 2 }, context(alpha.id, ops))
-      expect(newest.output).toContain("m4")
-      expect(newest.output).not.toContain("m1")
+      expect(newest.output).toContain("msg-four")
+      expect(newest.output).not.toContain("msg-one")
       expect(newest.output).toContain('has_older="true"')
       const fromSeq = Number(/from_seq="(\d+)"/.exec(newest.output)?.[1])
 
       const older = yield* def.execute({ action: "read", before: fromSeq, limit: 2 }, context(alpha.id, ops))
-      expect(older.output).toContain("m2")
-      expect(older.output).not.toContain("m4")
+      expect(older.output).toContain("msg-two")
+      expect(older.output).not.toContain("msg-four")
     }),
     { timeout: 30000 },
   )
 
-  it.instance("destroy refuses while others remain, then soft-deletes as the last member", () =>
+  // The default and empty windows must still advertise the cursor: without it a
+  // caller cannot tell "finished" from "empty room" from "bad args", and cannot
+  // learn the transcript size.
+  it.instance("emits a room_page on every read, including default and empty windows", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const alpha = yield* sessions.create({ title: "Alpha", agent: "build" })
+      const def = yield* (yield* RoomTool).init()
+      const ops = persistingOps(sessions)
+      yield* def.execute({ action: "create" }, context(alpha.id, ops))
+      yield* def.execute({ action: "post", message: "m1" }, context(alpha.id, ops))
+      yield* def.execute({ action: "post", message: "m2" }, context(alpha.id, ops))
+
+      const latest = yield* def.execute({ action: "read", limit: 1 }, context(alpha.id, ops))
+      expect(latest.output).toContain("<room_page ")
+      expect(latest.output).toContain('returned="1"')
+      expect(latest.output).toContain('total="3"')
+      expect(latest.output).toMatch(/from_seq="\d+"/)
+      expect(latest.output).toMatch(/to_seq="\d+"/)
+
+      const past = yield* def.execute({ action: "read", after: 9999 }, context(alpha.id, ops))
+      expect(past.output).toContain("<room_page ")
+      expect(past.output).toContain('returned="0"')
+      expect(past.output).toContain('has_newer="false"')
+      expect(past.output).toContain('total="3"')
+      // The empty window still has older entries before the cursor.
+      expect(past.output).toContain('has_older="true"')
+    }),
+    { timeout: 30000 },
+  )
+
+  // An empty before-window (nothing older than the cursor) must still advertise
+  // that newer entries exist, otherwise a caller cannot tell where to page.
+  it.instance("reports newer entries in an empty before-window", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const alpha = yield* sessions.create({ title: "Alpha", agent: "build" })
+      const def = yield* (yield* RoomTool).init()
+      const ops = persistingOps(sessions)
+      yield* def.execute({ action: "create" }, context(alpha.id, ops))
+      yield* def.execute({ action: "post", message: "one" }, context(alpha.id, ops))
+
+      const older = yield* def.execute({ action: "read", before: 0 }, context(alpha.id, ops))
+      expect(older.output).toContain('returned="0"')
+      expect(older.output).toContain('has_older="false"')
+      expect(older.output).toContain('has_newer="true"')
+    }),
+    { timeout: 30000 },
+  )
+
+  it.instance("read exposes message_id so a historical entry can be replied to", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const alpha = yield* sessions.create({ title: "Alpha", agent: "build" })
+      const def = yield* (yield* RoomTool).init()
+      const ops = persistingOps(sessions)
+      yield* def.execute({ action: "create" }, context(alpha.id, ops))
+      yield* def.execute({ action: "post", message: "root" }, context(alpha.id, ops))
+
+      const read = yield* def.execute({ action: "read" }, context(alpha.id, ops))
+      const rootID = /<room_message message_id="(msg_[^"]+)"/.exec(read.output)?.[1]
+      expect(rootID).toBeDefined()
+
+      yield* def.execute({ action: "post", message: "revision", reply_to: rootID }, context(alpha.id, ops))
+      const after = yield* def.execute({ action: "read" }, context(alpha.id, ops))
+      expect(after.output).toContain(`reply_to="${rootID}"`)
+    }),
+    { timeout: 30000 },
+  )
+
+  it.instance("rejects a reply_to that is not an existing message", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const alpha = yield* sessions.create({ title: "Alpha", agent: "build" })
+      const def = yield* (yield* RoomTool).init()
+      const ops = persistingOps(sessions)
+      yield* def.execute({ action: "create" }, context(alpha.id, ops))
+
+      const refusal = yield* def
+        .execute({ action: "post", message: "x", reply_to: "msg_missing" }, context(alpha.id, ops))
+        .pipe(Effect.exit)
+      expect(Exit.isFailure(refusal)).toBe(true)
+      expect(failureReason(refusal)).toContain("reply_to target not found")
+    }),
+    { timeout: 30000 },
+  )
+
+  it.instance("rejects a reply_to naming a message from another room", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const alpha = yield* sessions.create({ title: "Alpha", agent: "build" })
+      const def = yield* (yield* RoomTool).init()
+      const ops = persistingOps(sessions)
+      const first = (yield* def.execute({ action: "create" }, context(alpha.id, ops))).metadata.room
+      yield* def.execute({ action: "post", message: "in first" }, context(alpha.id, ops))
+      const read = yield* def.execute({ action: "read", room_id: first }, context(alpha.id, ops))
+      const foreignID = /<room_message message_id="(msg_[^"]+)"/.exec(read.output)?.[1]
+      expect(foreignID).toBeDefined()
+
+      const second = (yield* def.execute({ action: "create" }, context(alpha.id, ops))).metadata.room
+      expect(second).not.toBe(first)
+      const refusal = yield* def
+        .execute({ action: "post", message: "in second", reply_to: foreignID }, context(alpha.id, ops))
+        .pipe(Effect.exit)
+      expect(Exit.isFailure(refusal)).toBe(true)
+      expect(failureReason(refusal)).toContain("reply_to target not found")
+    }),
+    { timeout: 30000 },
+  )
+
+  it.instance("destroy soft-deletes the room: clears members, archives it, keeps the transcript", () =>
     Effect.gen(function* () {
       const sessions = yield* Session.Service
       const alpha = yield* sessions.create({ title: "Alpha", agent: "build" })
@@ -1319,12 +1562,6 @@ describe("tool.room", () => {
       yield* def.execute({ action: "invite", session_id: bravo.id }, context(alpha.id, ops))
       yield* def.execute({ action: "post", message: "before destroy" }, context(alpha.id, ops))
 
-      // A shared room cannot be destroyed out from under its other members.
-      const tooEarly = yield* def.execute({ action: "destroy" }, context(alpha.id, ops)).pipe(Effect.exit)
-      expect(Exit.isFailure(tooEarly)).toBe(true)
-      expect(roomOf(yield* sessions.get(bravo.id))).toBe(room)
-
-      yield* def.execute({ action: "kick", session_id: bravo.id }, context(alpha.id, ops))
       const destroyed = yield* def.execute({ action: "destroy" }, context(alpha.id, ops))
       expect(destroyed.output).toContain('state="destroyed"')
       expect(roomOf(yield* sessions.get(alpha.id))).toBeUndefined()
@@ -1348,14 +1585,112 @@ describe("tool.room", () => {
     { timeout: 30000 },
   )
 
-  // A busy member must not have a delivery injected into its running turn; the
-  // message is queued and flushed on the next idle transition.
-  it.instance("defers delivery to a busy member until it is idle", () =>
+  // destroy clears membership, so a later post has no `roomOf` to match. Naming
+  // the room must report the archive rather than the misleading "not in a room".
+  it.instance("reports a destroyed room instead of 'not in a room' when posting", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const alpha = yield* sessions.create({ title: "Alpha", agent: "build" })
+      const def = yield* (yield* RoomTool).init()
+      const ops = persistingOps(sessions)
+      const room = (yield* def.execute({ action: "create" }, context(alpha.id, ops))).metadata.room
+      yield* def.execute({ action: "destroy" }, context(alpha.id, ops))
+
+      const refusal = yield* def
+        .execute({ action: "post", room_id: room, message: "after" }, context(alpha.id, ops))
+        .pipe(Effect.exit)
+      expect(Exit.isFailure(refusal)).toBe(true)
+      expect(failureReason(refusal)).toContain("was destroyed")
+    }),
+    { timeout: 30000 },
+  )
+
+  // reply_to may reference any existing entry, including a system event: an
+  // agent is allowed to comment on (supersede) a membership/lifecycle event.
+  it.instance("accepts a reply_to naming a system event", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const alpha = yield* sessions.create({ title: "Alpha", agent: "build" })
+      const def = yield* (yield* RoomTool).init()
+      const ops = persistingOps(sessions)
+      yield* def.execute({ action: "create" }, context(alpha.id, ops))
+
+      const created = yield* def.execute({ action: "read" }, context(alpha.id, ops))
+      const eventID = /message_id="(msg_[^"]+)"[^>]*type="created"/.exec(created.output)?.[1]
+      expect(eventID).toBeDefined()
+
+      yield* def.execute({ action: "post", message: "on the created event", reply_to: eventID }, context(alpha.id, ops))
+      const after = yield* def.execute({ action: "read" }, context(alpha.id, ops))
+      expect(after.output).toContain(`reply_to="${eventID}"`)
+    }),
+    { timeout: 30000 },
+  )
+
+  // open/close/leave must report the archive, not "not a member": destroy clears
+  // every member, so membership is the wrong thing to check first.
+  it.instance("reports the destroyed room for open, close, and leave too", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const alpha = yield* sessions.create({ title: "Alpha", agent: "build" })
+      const def = yield* (yield* RoomTool).init()
+      const ops = persistingOps(sessions)
+      const room = (yield* def.execute({ action: "create" }, context(alpha.id, ops))).metadata.room
+      yield* def.execute({ action: "destroy" }, context(alpha.id, ops))
+
+      for (const action of ["open", "close", "leave"] as const) {
+        const refusal = yield* def.execute({ action, room_id: room }, context(alpha.id, ops)).pipe(Effect.exit)
+        expect(Exit.isFailure(refusal)).toBe(true)
+        expect(failureReason(refusal)).toContain("was destroyed")
+      }
+    }),
+    { timeout: 30000 },
+  )
+
+  // invite and self-join both append type="joined"; the inviter must be recorded
+  // so a reader can tell "I invited them" from "they joined themselves".
+  it.instance("invite records the inviter on the joined event", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const alpha = yield* sessions.create({ title: "Alpha", agent: "build" })
+      const bravo = yield* sessions.create({ title: "Bravo", agent: "build" })
+      const def = yield* (yield* RoomTool).init()
+      const ops = persistingOps(sessions)
+      const room = (yield* def.execute({ action: "create" }, context(alpha.id, ops))).metadata.room
+      yield* def.execute({ action: "invite", session_id: bravo.id }, context(alpha.id, ops))
+
+      const read = yield* def.execute({ action: "read", room_id: room }, context(alpha.id, ops))
+      expect(read.output).toContain('type="joined"')
+      expect(read.output).toContain(`by="${alpha.id}"`)
+      expect(read.output).toContain("was added to the room by")
+    }),
+    { timeout: 30000 },
+  )
+
+  it.instance("invite conflict points the caller at room leave", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const alpha = yield* sessions.create({ title: "Alpha", agent: "build" })
+      const bravo = yield* sessions.create({ title: "Bravo", agent: "build" })
+      const def = yield* (yield* RoomTool).init()
+      const ops = persistingOps(sessions)
+      yield* def.execute({ action: "create" }, context(alpha.id, ops))
+      yield* def.execute({ action: "create" }, context(bravo.id, ops))
+
+      const refusal = yield* def
+        .execute({ action: "invite", session_id: bravo.id }, context(alpha.id, ops))
+        .pipe(Effect.exit)
+      expect(Exit.isFailure(refusal)).toBe(true)
+      expect(failureReason(refusal)).toContain("ask it to run room leave")
+    }),
+    { timeout: 30000 },
+  )
+
+  // A message to a busy member is admitted into its session immediately, so it
+  // is visible as a queued turn instead of hidden until the turn ends.
+  it.instance("admits delivery to a busy member immediately", () =>
     Effect.gen(function* () {
       const sessions = yield* Session.Service
       const statuses = yield* SessionStatus.Service
-      const database = yield* Database.Service
-      const scope = yield* Scope.Scope
       const alpha = yield* sessions.create({ title: "Alpha", agent: "build" })
       const bravo = yield* sessions.create({ title: "Bravo", agent: "build" })
       const tool = yield* RoomTool
@@ -1366,11 +1701,6 @@ describe("tool.room", () => {
 
       yield* statuses.set(bravo.id, { type: "busy" })
       yield* def.execute({ action: "post", message: "deferred" }, context(alpha.id, ops))
-      const before = yield* roomEntries(sessions, bravo.id)
-      expect(before.some((text) => text.includes("deferred"))).toBe(false)
-
-      yield* statuses.set(bravo.id, { type: "idle" })
-      yield* drainDeliveries({ ops, statuses, sessions, scope, db: database.db }, bravo.id)
       const after = yield* roomEntries(sessions, bravo.id)
       expect(after.some((text) => text.includes("deferred"))).toBe(true)
     }),
@@ -1501,9 +1831,6 @@ describe("session.lease", () => {
 })
 
 describe("session.collaboration boundaries", () => {
-  const failureReason = (exit: Exit.Exit<unknown, unknown>) =>
-    Exit.isFailure(exit) ? String(Cause.squash(exit.cause)) : "ok"
-
   it.instance("destroy is idempotent and requires membership", () =>
     Effect.gen(function* () {
       const sessions = yield* Session.Service
@@ -1645,7 +1972,7 @@ describe("session.collaboration boundaries", () => {
     { timeout: 30000 },
   )
 
-  it.instance("deliver defers to the queue when another process holds the lease", () =>
+  it.instance("deliver admits to the session even when another process holds the lease", () =>
     Effect.gen(function* () {
       const sessions = yield* Session.Service
       const statuses = yield* SessionStatus.Service
@@ -1663,10 +1990,12 @@ describe("session.collaboration boundaries", () => {
       )
 
       expect(woke).toBe(false)
+      // The body is admitted for visibility; a wake marker waits for the other
+      // process to finish so it can be promoted then.
       expect(yield* SessionDelivery.hasPending(database.db, target.id)).toBe(true)
       const stored = yield* sessions.messages({ sessionID: target.id }).pipe(Effect.orDie)
       const injected = stored.flatMap((m) => m.parts).some((p) => p.type === "text" && p.text?.includes("remote-hello"))
-      expect(injected).toBe(false)
+      expect(injected).toBe(true)
     }),
     { timeout: 30000 },
   )

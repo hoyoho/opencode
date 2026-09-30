@@ -1,10 +1,12 @@
 import { useProject } from "../../context/project"
 import { useSync } from "../../context/sync"
-import { createMemo, For, Show } from "solid-js"
+import { createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js"
 import { useTheme } from "../../context/theme"
 import { useTuiConfig } from "../../config"
+import { useSDK } from "../../context/sdk"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
 import { usePluginRuntime } from "../../plugin/runtime"
+import type { Session } from "@opencode-ai/sdk/v2"
 
 import { getScrollAcceleration } from "../../util/scroll"
 import { WorkspaceLabel } from "../../component/workspace-label"
@@ -13,6 +15,7 @@ export function Sidebar(props: { sessionID: string; overlay?: boolean }) {
   const pluginRuntime = usePluginRuntime()
   const project = useProject()
   const sync = useSync()
+  const sdk = useSDK()
   const { theme } = useTheme()
   const tuiConfig = useTuiConfig()
   const session = createMemo(() => sync.session.get(props.sessionID))
@@ -22,13 +25,28 @@ export function Sidebar(props: { sessionID: string; overlay?: boolean }) {
     return project.workspace.get(workspaceID)
   }
   const scrollAcceleration = createMemo(() => getScrollAcceleration(tuiConfig))
+  // Partnership/room membership is project-wide, but the TUI's session store is
+  // directory-scoped. List project-wide here so the members shown match what
+  // `partner status` / `room status` report, even across directories.
+  const [members, setMembers] = createSignal<Session[]>([])
+  onMount(() => {
+    const refresh = () => {
+      void sdk.client.session
+        .list({ scope: "project" })
+        .then((result) => setMembers(result.data ?? []))
+        .catch(() => {})
+    }
+    refresh()
+    const timer = setInterval(refresh, 5000)
+    onCleanup(() => clearInterval(timer))
+  })
   const partnership = createMemo(() => {
     const value = session()?.metadata?.partners
     return typeof value === "string" && value.length > 0 ? value : undefined
   })
   const partners = createMemo(() =>
     partnership()
-      ? sync.data.session.filter(
+      ? members().filter(
           (item) =>
             item.id !== props.sessionID &&
             typeof item.metadata?.partners === "string" &&
@@ -43,7 +61,7 @@ export function Sidebar(props: { sessionID: string; overlay?: boolean }) {
   const isRoomSession = createMemo(() => session()?.metadata?.isRoom === true)
   const roomMembers = createMemo(() =>
     room()
-      ? sync.data.session.filter((item) => item.id !== props.sessionID && item.metadata?.room === room())
+      ? members().filter((item) => item.id !== props.sessionID && item.metadata?.room === room())
       : [],
   )
 

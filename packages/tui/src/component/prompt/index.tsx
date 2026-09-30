@@ -160,7 +160,15 @@ export function Prompt(props: PromptProps) {
   const tuiConfig = useTuiConfig()
   const dialog = useDialog()
   const toast = useToast()
-  const status = createMemo(() => sync.data.session_status?.[props.sessionID ?? ""] ?? { type: "idle" })
+  const status = createMemo(() => {
+    const sessionID = props.sessionID ?? ""
+    const live = sync.data.session_status?.[sessionID]
+    if (live && live.type !== "idle") return live
+    // A session another process is running has no in-memory status here; fall
+    // back to the durable message stream so the spinner still reflects it.
+    if (sessionID && sync.session.working(sessionID)) return { type: "busy" as const }
+    return live ?? { type: "idle" as const }
+  })
   const history = usePromptHistory()
   const stash = usePromptStash()
   const keymap = useOpencodeKeymap()
@@ -1080,55 +1088,61 @@ export function Prompt(props: PromptProps) {
       const restOfInput = firstLineEnd === -1 ? "" : inputText.slice(firstLineEnd + 1)
       const args = firstLineArgs.join(" ") + (restOfInput ? "\n" + restOfInput : "")
 
-      void sdk.client.session
-        .command(
-          {
-            sessionID,
-            command: command.slice(1),
-            arguments: args,
-            agent: agent.name,
-            model: `${selectedModel.providerID}/${selectedModel.modelID}`,
-            variant,
-            parts: nonTextParts.filter((x) => x.type === "file"),
-          },
-          { throwOnError: true },
-        )
-        .catch((error) => {
-          toast.show({
-            title: "Failed to run command",
-            message: errorMessage(error),
-            variant: "error",
-          })
-        })
+      void sdk.client.session.command({
+        sessionID,
+        command: command.slice(1),
+        arguments: args,
+        agent: agent.name,
+        model: `${selectedModel.providerID}/${selectedModel.modelID}`,
+        variant,
+        parts: nonTextParts.filter((x) => x.type === "file"),
+      })
     } else {
       move.startSubmit()
-      sdk.client.session
-        .prompt(
-          {
-            sessionID,
-            ...selectedModel,
-            agent: agent.name,
-            model: selectedModel,
-            variant,
-            parts: [
-              ...editorParts,
-              {
-                type: "text",
-                text: inputText,
-              },
-              ...nonTextParts,
-            ],
-          },
-          { throwOnError: true },
-        )
-        .catch((error) => {
-          toast.show({
-            title: "Failed to send prompt",
-            message: errorMessage(error),
-            variant: "error",
-          })
+      // Typing into a room session is the human speaking to the room: route it
+      // through room say (from="user") instead of running a model turn in the
+      // room. The room's own transcript shows the posted message; no command
+      // trace is left in any session.
+      const room = sessionID ? sync.session.get(sessionID) : undefined
+      if (room?.metadata?.isRoom === true) {
+        void sdk.client.session.command({
+          sessionID,
+          command: "roommgr",
+          arguments: `say ${inputText}`,
+          agent: agent.name,
+          model: `${selectedModel.providerID}/${selectedModel.modelID}`,
+          variant,
+          parts: nonTextParts.filter((x) => x.type === "file"),
         })
-      if (editorParts.length > 0) editor.markSelectionSent()
+      } else {
+        sdk.client.session
+          .prompt(
+            {
+              sessionID,
+              ...selectedModel,
+              agent: agent.name,
+              model: selectedModel,
+              variant,
+              parts: [
+                ...editorParts,
+                {
+                  type: "text",
+                  text: inputText,
+                },
+                ...nonTextParts,
+              ],
+            },
+            { throwOnError: true },
+          )
+          .catch((error) => {
+            toast.show({
+              title: "Failed to send prompt",
+              message: errorMessage(error),
+              variant: "error",
+            })
+          })
+        if (editorParts.length > 0) editor.markSelectionSent()
+      }
     }
     history.append({
       ...store.prompt,

@@ -21,9 +21,19 @@ const stripTokens = (input: string, count: number) => {
   return input.slice(index).trim()
 }
 
-// Free-text remainder: drop the leading subcommand/id tokens, then normalize
-// through `tokenize` so surrounding quotes are removed from the payload.
-const rest = (input: string, count: number) => tokenize(stripTokens(input.trim(), count)).join(" ")
+// Free-text remainder: drop the leading subcommand/id tokens, then keep the
+// rest verbatim (internal spaces, newlines, and quotes are preserved) so code,
+// JSON, and multi-line messages reach the transcript unchanged. A single pair
+// of wrapping quotes around the whole remainder is stripped, matching the
+// shell-like expectation for `/roommgr say "text with spaces"`.
+const rest = (input: string, count: number) => {
+  let value = input.trim()
+  for (let index = 0; index < count; index++) value = value.replace(/^\S+\s*/, "")
+  value = value.trim()
+  if (value.length >= 2 && (value[0] === '"' || value[0] === "'") && value[value.length - 1] === value[0])
+    return value.slice(1, -1)
+  return value
+}
 
 /**
  * Parses a `/roommgr` or `/partnermgr` argument string into a direct tool call.
@@ -38,6 +48,7 @@ export function parseManagerCommand(command: string, args: string): ManagerInvoc
 function parseRoomManager(args: string): ManagerInvocation {
   const [sub] = tokenize(args)
   switch (sub) {
+    case "new":
     case "create": {
       const title = rest(args, 1)
       return { tool: "room", params: { action: "create", ...(title ? { title } : {}) } }
@@ -68,30 +79,11 @@ function parseRoomManager(args: string): ManagerInvocation {
       const [roomID] = tokenize(stripTokens(args.trim(), 1))
       return { tool: "room", params: { action: "destroy", ...(roomID ? { room_id: roomID } : {}) } }
     }
+    case "say":
     case "post": {
       const message = rest(args, 1)
-      if (!message) return { error: "Usage: /roommgr post <message>" }
+      if (!message) return { error: "Usage: /roommgr say <message>" }
       return { tool: "room", params: { action: "post", message } }
-    }
-    case "read": {
-      const tokens = tokenize(stripTokens(args.trim(), 1))
-      const roomID = tokens.find((token) => token.startsWith("ses_"))
-      const limitToken = tokens.find((token) => /^\d+$/.test(token))
-      const afterToken = tokens.find((token) => /^after=\d+$/.test(token))
-      const beforeToken = tokens.find((token) => /^before=\d+$/.test(token))
-      const skipEvents = tokens.includes("skip_events")
-      const limit = limitToken ? Number(limitToken) : undefined
-      return {
-        tool: "room",
-        params: {
-          action: "read",
-          ...(roomID ? { room_id: roomID } : {}),
-          ...(limit ? { limit } : {}),
-          ...(afterToken ? { after: Number(afterToken.slice("after=".length)) } : {}),
-          ...(beforeToken ? { before: Number(beforeToken.slice("before=".length)) } : {}),
-          ...(skipEvents ? { skip_events: true } : {}),
-        },
-      }
     }
     case "status": {
       const [roomID] = tokenize(stripTokens(args.trim(), 1))
@@ -101,7 +93,7 @@ function parseRoomManager(args: string): ManagerInvocation {
       return {
         error: [
           `Unknown roommgr subcommand: ${sub ?? "(none)"}.`,
-          "/roommgr create [title] | destroy [room-id] | join <room-id> | leave | invite <session-id> | kick <session-id> | close [room-id] | open [room-id] | post <message> | read [room-id] [limit] [after=<seq>] [before=<seq>] [skip_events] | status [room-id]",
+          "/roommgr new [title] | join <room-id> | leave | invite <session-id> | kick <session-id> | close [room-id] | open [room-id] | destroy [room-id] | say <message> | status [room-id]",
         ].join("\n"),
       }
   }
@@ -116,17 +108,12 @@ function parsePartnerManager(args: string): ManagerInvocation {
       if (!sessionID) return { error: `Usage: /partnermgr ${sub} <session-id>` }
       return { tool: "partner", params: { action: sub, session_id: sessionID } }
     }
+    case "leave":
+      return { tool: "partner", params: { action: "leave" } }
     case "broadcast": {
       const message = rest(args, 1)
       if (!message) return { error: "Usage: /partnermgr broadcast <message>" }
       return { tool: "partner", params: { action: "broadcast", message } }
-    }
-    case "talk": {
-      const [sessionID] = tokenize(stripTokens(args.trim(), 1))
-      if (!sessionID) return { error: "Usage: /partnermgr talk <session-id> <message>" }
-      const message = rest(args, 2)
-      if (!message) return { error: "Usage: /partnermgr talk <session-id> <message>" }
-      return { tool: "partner", params: { action: "talk", session_id: sessionID, message } }
     }
     case "status":
       return { tool: "partner", params: { action: "status" } }
@@ -134,7 +121,7 @@ function parsePartnerManager(args: string): ManagerInvocation {
       return {
         error: [
           `Unknown partnermgr subcommand: ${sub ?? "(none)"}.`,
-          "/partnermgr add <session-id> | remove <session-id> | broadcast <message> | talk <session-id> <message> | status",
+          "/partnermgr add <session-id> | remove <session-id> | leave | broadcast <message> | status",
         ].join("\n"),
       }
   }

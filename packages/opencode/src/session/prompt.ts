@@ -9,6 +9,7 @@ import { SessionRevert } from "./revert"
 import { Session } from "./session"
 import { renderRoster, partnershipOf, roomOf } from "./collaboration"
 import { SessionLease } from "./lease"
+import { SessionInterrupt } from "./interrupt"
 import { parseManagerCommand } from "./manager-commands"
 import { Agent } from "../agent/agent"
 import { Provider } from "@/provider/provider"
@@ -69,6 +70,10 @@ const decodeMessagePart = Schema.decodeUnknownExit(SessionV1.Part)
 const MAX_MCP_RESOURCE_BLOB_BYTES = 10 * 1024 * 1024
 // Renew the session lease well before its TTL (90s) so a live run keeps it.
 const LEASE_RENEW_MS = 30_000
+// How often the lease owner checks for a cross-process interrupt request. Small
+// enough that ESC on another process feels immediate, large enough to avoid a
+// busy DB poll per running session.
+const INTERRUPT_POLL_MS = 500
 const SUPPORTED_MCP_RESOURCE_ATTACHMENT_MIMES = new Set([
   "application/pdf",
   "image/gif",
@@ -158,6 +163,14 @@ const layer = Layer.effect(
 
     const cancel = Effect.fn("SessionPrompt.cancel")(function* (sessionID: SessionID) {
       yield* Effect.logInfo("cancel", { "session.id": sessionID })
+      yield* SessionInterrupt.ensure(db)
+      // A run owned by another process is absent from this process's runner
+      // map, so `state.cancel` would only flip local status. Signal it durably
+      // instead; the lease owner polls and interrupts itself.
+      if (yield* SessionLease.foreignHeld(db, sessionID)) {
+        yield* SessionInterrupt.request(db, sessionID)
+        return
+      }
       yield* state.cancel(sessionID)
     })
 
@@ -1375,16 +1388,35 @@ const layer = Layer.effect(
       Effect.gen(function* () {
         yield* SessionLease.ensure(db)
         yield* SessionLease.claim(db, sessionID)
+        yield* SessionInterrupt.ensure(db)
+        // A new run must not inherit a request that already stopped a previous
+        // one (or arrived just as the last turn finished).
+        yield* SessionInterrupt.clear(db, sessionID)
         return yield* Effect.scoped(
           Effect.gen(function* () {
             const inner = yield* Scope.Scope
             yield* Effect.forever(
               Effect.sleep(Duration.millis(LEASE_RENEW_MS)).pipe(Effect.andThen(SessionLease.claim(db, sessionID))),
             ).pipe(Effect.forkIn(inner, { startImmediately: true }))
+            // The lease owner is the only process running this session, so a
+            // request written by another process's abort handler surfaces here.
+            yield* Effect.forever(
+              Effect.sleep(Duration.millis(INTERRUPT_POLL_MS)).pipe(
+                Effect.andThen(SessionInterrupt.pending(db, sessionID)),
+                Effect.andThen((requested) =>
+                  requested
+                    ? SessionInterrupt.clear(db, sessionID).pipe(Effect.andThen(state.cancel(sessionID)))
+                    : Effect.void,
+                ),
+              ),
+            ).pipe(Effect.forkIn(inner, { startImmediately: true }))
             return yield* effect
           }),
         )
-      }).pipe(Effect.ensuring(SessionLease.release(db, sessionID)))
+      }).pipe(
+        Effect.ensuring(SessionInterrupt.clear(db, sessionID)),
+        Effect.ensuring(SessionLease.release(db, sessionID)),
+      )
 
     const loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.loop")(function* (
       input: LoopInput,
@@ -1432,6 +1464,7 @@ const layer = Layer.effect(
       model: Provider.Model
       parentID: MessageID
       text: string
+      ignored?: boolean
     }) {
       const ictx = yield* InstanceState.context
       const id = MessageID.ascending()
@@ -1457,6 +1490,7 @@ const layer = Layer.effect(
         sessionID: input.sessionID,
         type: "text",
         text: input.text,
+        ...(input.ignored ? { ignored: true } : {}),
       } satisfies SessionV1.Part)
       return { info: message, parts: [part] } satisfies SessionV1.WithParts
     })
@@ -1471,8 +1505,7 @@ const layer = Layer.effect(
       model: Provider.Model,
     ) {
       const invocation = parseManagerCommand(input.command, input.arguments)
-      // Detaching yourself (room leave/destroy, or partner remove of your own
-      // session id) is the escape hatch out of a room or partnership. A room
+      // leave/destroy are the escape hatch out of a room or partnership. A room
       // wake can keep this session busy, so instead of refusing we interrupt the
       // local turn and then run. Other manager commands still refuse while busy:
       // their synthetic turn would truncate an in-flight one.
@@ -1481,9 +1514,7 @@ const layer = Layer.effect(
         "tool" in invocation &&
         ((invocation.tool === "room" &&
           (invocation.params.action === "leave" || invocation.params.action === "destroy")) ||
-          (invocation.tool === "partner" &&
-            invocation.params.action === "remove" &&
-            invocation.params.session_id === input.sessionID))
+          (invocation.tool === "partner" && invocation.params.action === "leave"))
       // Manager commands write a synthetic assistant turn, which would truncate
       // an in-flight turn. Refuse while another process is running this session
       // (the cross-process lease is the only shared signal).
@@ -1503,12 +1534,31 @@ const layer = Layer.effect(
         messageID: input.messageID,
         agent: agent.name,
         model: modelRef,
-        parts: [{ type: "text" as const, text: `/${input.command}${input.arguments ? ` ${input.arguments}` : ""}` }],
+        parts: [
+          {
+            type: "text" as const,
+            text: `/${input.command}${input.arguments ? ` ${input.arguments}` : ""}`,
+            // The user's operation log stays visible in the transcript but is
+            // not sent to the model, so a god-view operator leaves no trace in
+            // the agent's context.
+            ignored: true,
+          },
+        ],
         variant: input.variant,
         noReply: true,
       })
+      // The user operates with a god view: their command line and its reply are
+      // `ignored`, so no model perceives the operation or spends tokens on it,
+      // while the TUI still shows them to the user.
       const fail = (text: string) =>
-        directReply({ sessionID: input.sessionID, agent: agent.name, model, parentID: user.info.id, text })
+        directReply({
+          sessionID: input.sessionID,
+          agent: agent.name,
+          model,
+          parentID: user.info.id,
+          text,
+          ignored: true,
+        })
       if (!invocation) return yield* fail("Unknown manager command.")
       if ("error" in invocation) return yield* fail(invocation.error)
 
