@@ -59,9 +59,12 @@ export function Sidebar(props: { sessionID: string; overlay?: boolean }) {
     return typeof value === "string" && value.startsWith("ses") ? value : undefined
   })
   const isRoomSession = createMemo(() => session()?.metadata?.isRoom === true)
+  // When viewing the room itself there is no `metadata.room`; the room id is
+  // this session. Members are the sessions pointing their `metadata.room` here.
+  const roomID = createMemo(() => (isRoomSession() ? props.sessionID : room()))
   const roomMembers = createMemo(() =>
-    room()
-      ? members().filter((item) => item.id !== props.sessionID && item.metadata?.room === room())
+    roomID()
+      ? members().filter((item) => item.id !== props.sessionID && item.metadata?.room === roomID())
       : [],
   )
 
@@ -129,8 +132,9 @@ export function Sidebar(props: { sessionID: string; overlay?: boolean }) {
                 </Show>
                 <Show when={isRoomSession()}>
                   <text fg={theme.textMuted}>
-                    <span style={{ fg: theme.info }}>Room</span> <span>({roomMembers().length + 1})</span>
+                    <span style={{ fg: theme.info }}>Room</span> <span>({roomMembers().length})</span>
                   </text>
+                  <For each={roomMembers()}>{(item) => <text fg={theme.textMuted}>{item.id}</text>}</For>
                 </Show>
                 <Show when={room()}>
                   <text fg={theme.textMuted}>

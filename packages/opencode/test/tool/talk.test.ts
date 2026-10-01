@@ -475,9 +475,9 @@ describe("tool.partner", () => {
     { timeout: 30000 },
   )
 
-  // A membership change caused by the user is invisible to the models (no
-  // tokens) but still delivered so the TUI can show it.
-  it.instance("marks a user-initiated membership change as ignored", () =>
+  // A membership change is delivered as a visible message so the model sees the
+  // result (but never the command that caused it). Notify only: no wake.
+  it.instance("delivers a user-initiated membership change as a visible message", () =>
     Effect.gen(function* () {
       const sessions = yield* Session.Service
       const alpha = yield* sessions.create({ title: "Alpha", agent: "build" })
@@ -494,7 +494,7 @@ describe("tool.partner", () => {
       const parts = stored
         .flatMap((message) => message.parts)
         .filter((part): part is SessionV1.TextPart => part.type === "text")
-      expect(parts.some((part) => part.text.includes("removed") && part.ignored === true)).toBe(true)
+      expect(parts.some((part) => part.text.includes("removed") && part.ignored !== true)).toBe(true)
     }),
     { timeout: 30000 },
   )
@@ -752,10 +752,12 @@ describe("tool.partner", () => {
       yield* def.execute({ action: "join", room_id: room }, context(bravo.id, ops))
 
       const afterRejoin = yield* roomEntries(sessions, bravo.id)
-      // Only the one event that was never settled for bravo, in a new batched
-      // part. A `forget` regression would ALSO arrive as one part, so the
-      // discriminating assertion is the entry count, not the part count.
-      expect(afterRejoin.length).toBe(firstJoin.length + 1)
+      // Two new parts: the leave notice handed to the leaver directly (a
+      // `<room_notice>`, so it adds a part but not a room entry), and the one
+      // event that was never settled for bravo, in a new batched part. A
+      // `forget` regression would also arrive as one part, so the discriminating
+      // assertion is the entry count, not the part count.
+      expect(afterRejoin.length).toBe(firstJoin.length + 2)
       expect(roomEntryCount(afterRejoin)).toBe(roomEntryCount(firstJoin) + 1)
       expect(afterRejoin[afterRejoin.length - 1]).toContain('type="left"')
     }),
@@ -1070,8 +1072,8 @@ describe("tool.partner broadcast", () => {
 
       expect(seen.map((item) => item.sessionID).toSorted()).toEqual([alpha.id, bravo.id].toSorted())
       expect(seen.every((item) => item.text.includes('sender="user"'))).toBe(true)
-      expect(seen.every((item) => item.text.includes("<partner_broadcast"))).toBe(true)
-      expect(result.output).toContain("<partner_broadcast")
+      expect(seen.every((item) => item.text.includes("<broadcast"))).toBe(true)
+      expect(result.output).toContain("<broadcast")
       expect(result.output).toContain('sender="user"')
       expect(result.output).not.toContain("Broadcast delivered")
     }),

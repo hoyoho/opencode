@@ -1384,58 +1384,77 @@ const layer = Layer.effect(
     // another run is already in flight, so only the real owner claims/releases.
     // The renewal fiber is a child of an inner scope so a finished turn cannot
     // leave a live renewer pinning the lease forever.
-    const withLease = <A, E, R>(sessionID: SessionID, effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
+    //
+    // The claim result is authoritative. Another process may already be running
+    // this session (a room/partner wake can execute it in the process that
+    // delivered the message). Starting a second local run would duplicate the
+    // session and project the in-flight tool as interrupted, so when the lease
+    // is foreign-held the caller's `onForeign` runs instead of `effect`.
+    const withLease = <A, E, R, A2, E2, R2>(
+      sessionID: SessionID,
+      effect: Effect.Effect<A, E, R>,
+      onForeign: Effect.Effect<A2, E2, R2>,
+    ): Effect.Effect<A | A2, E | E2, R | R2> =>
       Effect.gen(function* () {
         yield* SessionLease.ensure(db)
-        yield* SessionLease.claim(db, sessionID)
-        yield* SessionInterrupt.ensure(db)
-        // A new run must not inherit a request that already stopped a previous
-        // one (or arrived just as the last turn finished).
-        yield* SessionInterrupt.clear(db, sessionID)
-        return yield* Effect.scoped(
-          Effect.gen(function* () {
-            const inner = yield* Scope.Scope
-            yield* Effect.forever(
-              Effect.sleep(Duration.millis(LEASE_RENEW_MS)).pipe(Effect.andThen(SessionLease.claim(db, sessionID))),
-            ).pipe(Effect.forkIn(inner, { startImmediately: true }))
-            // The lease owner is the only process running this session, so a
-            // request written by another process's abort handler surfaces here.
-            yield* Effect.forever(
-              Effect.sleep(Duration.millis(INTERRUPT_POLL_MS)).pipe(
-                Effect.andThen(SessionInterrupt.pending(db, sessionID)),
-                Effect.andThen((requested) =>
-                  requested
-                    ? SessionInterrupt.clear(db, sessionID).pipe(Effect.andThen(state.cancel(sessionID)))
-                    : Effect.void,
+        const owned = yield* SessionLease.claim(db, sessionID)
+        if (!owned) return yield* onForeign
+        return yield* Effect.gen(function* () {
+          yield* SessionInterrupt.ensure(db)
+          // A new run must not inherit a request that already stopped a previous
+          // one (or arrived just as the last turn finished).
+          yield* SessionInterrupt.clear(db, sessionID)
+          return yield* Effect.scoped(
+            Effect.gen(function* () {
+              const inner = yield* Scope.Scope
+              yield* Effect.forever(
+                Effect.sleep(Duration.millis(LEASE_RENEW_MS)).pipe(Effect.andThen(SessionLease.claim(db, sessionID))),
+              ).pipe(Effect.forkIn(inner, { startImmediately: true }))
+              // The lease owner is the only process running this session, so a
+              // request written by another process's abort handler surfaces here.
+              yield* Effect.forever(
+                Effect.sleep(Duration.millis(INTERRUPT_POLL_MS)).pipe(
+                  Effect.andThen(SessionInterrupt.pending(db, sessionID)),
+                  Effect.andThen((requested) =>
+                    requested
+                      ? SessionInterrupt.clear(db, sessionID).pipe(Effect.andThen(state.cancel(sessionID)))
+                      : Effect.void,
+                  ),
                 ),
-              ),
-            ).pipe(Effect.forkIn(inner, { startImmediately: true }))
-            return yield* effect
-          }),
+              ).pipe(Effect.forkIn(inner, { startImmediately: true }))
+              return yield* effect
+            }),
+          )
+        }).pipe(
+          Effect.ensuring(SessionInterrupt.clear(db, sessionID)),
+          Effect.ensuring(SessionLease.release(db, sessionID)),
         )
-      }).pipe(
-        Effect.ensuring(SessionInterrupt.clear(db, sessionID)),
-        Effect.ensuring(SessionLease.release(db, sessionID)),
-      )
+      })
 
     const loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.loop")(function* (
       input: LoopInput,
     ) {
+      // When another process owns the lease it is already running this session
+      // and will pick up the newly admitted user message at its next boundary.
       return yield* state.ensureRunning(
         input.sessionID,
         lastAssistant(input.sessionID),
-        withLease(input.sessionID, runLoop(input.sessionID)),
+        withLease(input.sessionID, runLoop(input.sessionID), lastAssistant(input.sessionID)),
       )
     })
 
     const shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError> = Effect.fn(
       "SessionPrompt.shell",
     )(function* (input: ShellInput) {
+      // A shell must not run alongside a run another process already owns.
+      yield* SessionLease.ensure(db)
+      if (yield* SessionLease.foreignHeld(db, input.sessionID))
+        return yield* Effect.fail(new Session.BusyError({ sessionID: input.sessionID }))
       const ready = yield* Latch.make()
       return yield* state.startShell(
         input.sessionID,
         lastAssistant(input.sessionID),
-        withLease(input.sessionID, shellImpl(input, ready)),
+        withLease(input.sessionID, shellImpl(input, ready), lastAssistant(input.sessionID)),
         ready,
       )
     })
@@ -1446,15 +1465,14 @@ const layer = Layer.effect(
       ctx: Tool.Context,
     ) =>
       def.execute(params as unknown as Schema.Schema.Type<P>, ctx).pipe(
-        Effect.map((result) => result.output),
+        Effect.map((result) => ({ ok: true as const, text: result.output })),
         // User-facing: a manager-command refusal must read as a sentence, not a
         // stack trace. The guard errors are plain Errors; render their message
-        // only, and fall back to String() for non-Error defects. (Cause.pretty
-        // stays for logs, not for the persisted assistant reply.)
+        // only, and fall back to String() for non-Error defects.
         Effect.catchCause((cause) => {
           const squashed = Cause.squash(cause)
           const message = squashed instanceof Error ? squashed.message : String(squashed)
-          return Effect.succeed(`Command failed: ${message}`)
+          return Effect.succeed({ ok: false as const, text: `Command failed: ${message}` })
         }),
       )
 
@@ -1465,6 +1483,10 @@ const layer = Layer.effect(
       parentID: MessageID
       text: string
       ignored?: boolean
+      // A manager command that runs while a turn is in flight must not persist
+      // its reply: the synthetic assistant message would satisfy the running
+      // loop's exit test. Such a reply is returned to the caller only.
+      persist?: boolean
     }) {
       const ictx = yield* InstanceState.context
       const id = MessageID.ascending()
@@ -1483,21 +1505,26 @@ const layer = Layer.effect(
         sessionID: input.sessionID,
         finish: "stop",
       }
-      yield* sessions.updateMessage(message)
-      const part = yield* sessions.updatePart({
+      const part: SessionV1.Part = {
         id: PartID.ascending(),
         messageID: id,
         sessionID: input.sessionID,
         type: "text",
         text: input.text,
         ...(input.ignored ? { ignored: true } : {}),
-      } satisfies SessionV1.Part)
+      }
+      if (input.persist !== false) {
+        yield* sessions.updateMessage(message)
+        yield* sessions.updatePart(part)
+      }
       return { info: message, parts: [part] } satisfies SessionV1.WithParts
     })
 
-    // `/roommgr` and `/partnermgr` run directly: the command is recorded as a
-    // user turn, the room/partner tool executes with sender=user, and the tool
-    // output is written back as an assistant turn. No model round-trip happens.
+    // `/roommgr` and `/partnermgr` run directly (no model round-trip) and are a
+    // god-view operation: the user's command itself is never written to any
+    // session, so the model never sees the action and the TUI never shows a
+    // stray command line next to the effect. The tool runs with sender=user and
+    // its effect (delivered messages, membership events) is what shows up.
     const managerCommand = Effect.fn("SessionPrompt.managerCommand")(function* (
       input: CommandInput,
       agent: Agent.Info,
@@ -1505,79 +1532,60 @@ const layer = Layer.effect(
       model: Provider.Model,
     ) {
       const invocation = parseManagerCommand(input.command, input.arguments)
-      // leave/destroy are the escape hatch out of a room or partnership. A room
-      // wake can keep this session busy, so instead of refusing we interrupt the
-      // local turn and then run. Other manager commands still refuse while busy:
-      // their synthetic turn would truncate an in-flight one.
-      const detach =
-        invocation !== undefined &&
-        "tool" in invocation &&
-        ((invocation.tool === "room" &&
-          (invocation.params.action === "leave" || invocation.params.action === "destroy")) ||
-          (invocation.tool === "partner" && invocation.params.action === "leave"))
-      // Manager commands write a synthetic assistant turn, which would truncate
-      // an in-flight turn. Refuse while another process is running this session
-      // (the cross-process lease is the only shared signal).
-      yield* SessionLease.ensure(db)
-      if (yield* SessionLease.foreignHeld(db, input.sessionID))
-        return yield* Effect.fail(new Session.BusyError({ sessionID: input.sessionID }))
-      if (detach) {
-        const busy = yield* state
-          .assertNotBusy(input.sessionID)
-          .pipe(Effect.as(false), Effect.catchTag("SessionBusyError", () => Effect.succeed(true)))
-        if (busy) yield* state.cancel(input.sessionID)
-      } else {
-        yield* state.assertNotBusy(input.sessionID)
-      }
-      const user = yield* prompt({
-        sessionID: input.sessionID,
-        messageID: input.messageID,
-        agent: agent.name,
-        model: modelRef,
-        parts: [
-          {
-            type: "text" as const,
-            text: `/${input.command}${input.arguments ? ` ${input.arguments}` : ""}`,
-            // The user's operation log stays visible in the transcript but is
-            // not sent to the model, so a god-view operator leaves no trace in
-            // the agent's context.
-            ignored: true,
-          },
-        ],
-        variant: input.variant,
-        noReply: true,
+      const promptOps = yield* ops()
+      const { room, partner } = yield* registry.named()
+
+      const execute = (
+        inv: { readonly tool: "room" | "partner"; readonly params: Record<string, unknown> },
+        messageID: MessageID,
+      ) =>
+        Effect.gen(function* () {
+          const toolCtx: Tool.Context = {
+            sessionID: input.sessionID,
+            messageID,
+            agent: agent.name,
+            abort: new AbortController().signal,
+            extra: { promptOps, sender: "user" },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          }
+          return inv.tool === "room"
+            ? yield* runManagerTool(room, inv.params, toolCtx)
+            : yield* runManagerTool(partner, inv.params, toolCtx)
+        })
+
+      // Manager commands never refuse on busy and never interrupt. The effect
+      // (room/partner events, broadcasts, room posts) is what this and other
+      // sessions observe.
+      const outcome = yield* Effect.gen(function* () {
+        if (invocation === undefined) return { ok: false as const, text: "Unknown manager command." }
+        if ("error" in invocation) return { ok: false as const, text: invocation.error }
+        return yield* execute(invocation, MessageID.ascending())
       })
-      // The user operates with a god view: their command line and its reply are
-      // `ignored`, so no model perceives the operation or spends tokens on it,
-      // while the TUI still shows them to the user.
-      const fail = (text: string) =>
-        directReply({
+
+      // A query must show the user its output; a failed operation shows the
+      // reason. Both are persisted as `ignored` assistant messages (TUI-only,
+      // model-invisible).
+      const isQuery = invocation !== undefined && "tool" in invocation && invocation.params.action === "status"
+      if (!isQuery && outcome.ok)
+        return yield* directReply({
           sessionID: input.sessionID,
           agent: agent.name,
           model,
-          parentID: user.info.id,
-          text,
+          parentID: MessageID.ascending(),
+          text: outcome.text,
           ignored: true,
+          persist: false,
         })
-      if (!invocation) return yield* fail("Unknown manager command.")
-      if ("error" in invocation) return yield* fail(invocation.error)
-
-      const { room, partner } = yield* registry.named()
-      const toolCtx: Tool.Context = {
+      return yield* directReply({
         sessionID: input.sessionID,
-        messageID: user.info.id,
         agent: agent.name,
-        abort: new AbortController().signal,
-        extra: { promptOps: yield* ops(), sender: "user" },
-        messages: [],
-        metadata: () => Effect.void,
-        ask: () => Effect.void,
-      }
-      const text =
-        invocation.tool === "room"
-          ? yield* runManagerTool(room, invocation.params, toolCtx)
-          : yield* runManagerTool(partner, invocation.params, toolCtx)
-      return yield* fail(text)
+        model,
+        parentID: MessageID.ascending(),
+        text: outcome.text,
+        ignored: true,
+      })
     })
 
     const command = Effect.fn("SessionPrompt.command")(function* (input: CommandInput) {

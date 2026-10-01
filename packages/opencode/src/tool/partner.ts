@@ -33,6 +33,8 @@ export const DESCRIPTION = [
 
 const newPartnershipID = () => `prt-${crypto.randomUUID().slice(0, 8)}`
 
+const now = () => new Date().toISOString()
+
 const renderOutput = (partnership: string, partners: readonly Session.Info[]) =>
   [
     `<partnership id="${partnership}" count="${partners.length}">`,
@@ -58,7 +60,7 @@ const renderEvent = (kind: EventKind, subject: Session.Info, partnership: string
         ? `Session ${who} left the partnership "${partnership}".`
         : `Session ${who} was removed from the partnership "${partnership}" by ${actor.id} (${actor.agent ?? "unknown"}).`
   return [
-    `<partnership_event type="${kind}" session="${subject.id}" agent="${subject.agent ?? "unknown"}" partnership="${partnership}">`,
+    `<partnership_event type="${kind}" at="${now()}" session="${subject.id}" agent="${subject.agent ?? "unknown"}" partnership="${partnership}">`,
     text,
     "</partnership_event>",
   ].join("\n")
@@ -88,14 +90,14 @@ export const PartnerTool = Tool.define(
       const leaving = action === "leave"
       const deps = { ops, statuses, sessions, scope, db }
 
+      // Membership changes are notified to every affected member as a visible
+      // message (the model sees the result, not the command that caused it).
+      // Notify only: never wake for a state change.
       const notify = (targets: readonly Session.Info[], text: string) =>
-        Effect.forEach(
-          targets,
-          // A membership change caused by the user is invisible to the models
-          // (no tokens); an agent-caused change stays visible so peers can react.
-          (target) => deliver(deps, target, text, { wake: false, ignored: sender === "user" }),
-          { concurrency: "unbounded", discard: true },
-        )
+        Effect.forEach(targets, (target) => deliver(deps, target, text, { wake: false }), {
+          concurrency: "unbounded",
+          discard: true,
+        })
 
       const deliverOne = (target: Session.Info, text: string) =>
         Effect.gen(function* () {
@@ -105,11 +107,18 @@ export const PartnerTool = Tool.define(
 
       // A one-member partnership is meaningless: once a removal leaves a single
       // member, clear that member's id so it does not stay in a group of one.
-      const dissolveIfAlone = (remaining: readonly Session.Info[]) =>
+      const dissolveIfAlone = (partnership: string, remaining: readonly Session.Info[]) =>
         Effect.gen(function* () {
           const lone = remaining.length === 1 ? remaining[0] : undefined
           if (!lone) return
           yield* sessions.patchMetadata({ sessionID: lone.id, metadata: { partners: undefined } })
+          // The last member is now solo: tell it the partnership dissolved.
+          yield* deliver(
+            deps,
+            lone,
+            `<partnership_event type="dissolved" at="${now()}" partnership="${partnership}">The partnership was dissolved.</partnership_event>`,
+            { wake: false },
+          )
         })
 
       if (action === "status") {
@@ -160,9 +169,9 @@ export const PartnerTool = Tool.define(
           metadata: { action: "broadcast", partners: partnership, count: partners.length },
         })
         const text = [
-          `<partner_broadcast sender="${sender === "user" ? "user" : ctx.sessionID}">`,
+          `<broadcast sender="${sender === "user" ? "user" : ctx.sessionID}" at="${now()}">`,
           params.message,
-          "</partner_broadcast>",
+          "</broadcast>",
         ].join("\n")
         yield* Effect.forEach(
           targets,
@@ -210,7 +219,7 @@ export const PartnerTool = Tool.define(
           metadata: { action: "talk", session_id: target.id, relation: kind },
         })
         const text = [
-          `<agent_message sender="${sender === "user" ? "user" : ctx.sessionID}" relation="${kind}">`,
+          `<agent_message sender="${sender === "user" ? "user" : ctx.sessionID}" relation="${kind}" at="${now()}">`,
           params.message,
           "</agent_message>",
         ].join("\n")
@@ -242,7 +251,7 @@ export const PartnerTool = Tool.define(
         yield* sessions.patchMetadata({ sessionID: current.id, metadata: { partners: undefined } })
         yield* notify(all, renderEvent("left", current, partnership, current))
         const dissolved = members.length === 1
-        yield* dissolveIfAlone(members)
+        yield* dissolveIfAlone(partnership, members)
         const metadata: PartnerMetadata = { partners: undefined, count: 0 }
         return {
           title: "Left partnership",
@@ -291,7 +300,7 @@ export const PartnerTool = Tool.define(
         yield* notify(remaining, renderEvent("left", target, partnership, current))
         yield* notify([target], renderEvent("removed", target, partnership, current))
         const dissolved = remaining.length === 1
-        yield* dissolveIfAlone(remaining)
+        yield* dissolveIfAlone(partnership, remaining)
         const metadata: PartnerMetadata = dissolved
           ? { partners: undefined, count: 0 }
           : { partners: partnership, count: remaining.length }

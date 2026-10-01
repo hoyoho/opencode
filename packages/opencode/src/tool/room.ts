@@ -118,6 +118,9 @@ const renderEvent = (
   ].join("\n")
 }
 
+const renderNotice = (room: SessionID, text: string) =>
+  [`<room_notice room="${room}" at="${now()}">`, text, "</room_notice>"].join("\n")
+
 const textOf = (message: { parts: ReadonlyArray<{ type: string; text?: string; synthetic?: boolean }> }) =>
   message.parts.flatMap((part) =>
     part.type === "text" && part.text !== undefined && part.synthetic !== true ? [part.text] : [],
@@ -158,6 +161,7 @@ export const RoomTool = Tool.define(
       const sender: "user" | "agent" = ctx.extra?.sender === "user" ? "user" : "agent"
 
       const current = yield* sessions.get(ctx.sessionID)
+      const deps = { ops, statuses, sessions, scope, db }
 
       // Legacy rooms tracked seq in metadata.room_seq with the message written
       // before the counter, so the counter can trail the transcript. When this
@@ -218,7 +222,6 @@ export const RoomTool = Tool.define(
         exclude?: SessionID,
         doWake = false,
         force = false,
-        ignored = false,
       ) {
         const roomMessages = yield* sessions.messages({ sessionID: roomID })
         const entries: { id: string; seq: number; text: string }[] = []
@@ -232,7 +235,6 @@ export const RoomTool = Tool.define(
         const members = (yield* sessions.list()).filter(
           (item) => item.id !== exclude && !isRoom(item) && roomOf(item) === roomID,
         )
-        const deps = { ops, statuses, sessions, scope, db }
         yield* Effect.forEach(
           members,
           (member) =>
@@ -257,7 +259,7 @@ export const RoomTool = Tool.define(
                 // Admit the batch into the member's session right away, so it is
                 // visible as a queued turn; a running turn promotes it at its
                 // next boundary instead of hiding it in the delivery queue.
-                yield* deliver(deps, member, text, { wake: doWake, force, ignored })
+                yield* deliver(deps, member, text, { wake: doWake, force })
                 // The room ledger only tracks the hand-off into the session; the
                 // session owns the message from here.
                 yield* Effect.forEach(
@@ -284,7 +286,7 @@ export const RoomTool = Tool.define(
         // Keep the delivery ledger: it acts as a watermark, so a rejoin resumes
         // from the gap instead of replaying the whole transcript.
         yield* append(previous, (seq) => renderEvent(previous, "left", session, seq, undefined, { currentID: current.id, sender }))
-        yield* sync(previous, undefined, false, false, sender === "user")
+        yield* sync(previous)
       })
 
       const roomState = (room: Session.Info): "open" | "closed" | "destroyed" => {
@@ -298,7 +300,7 @@ export const RoomTool = Tool.define(
         const appended = yield* append(room.id, (seq) => renderEvent(room.id, "created", current, seq, undefined, { currentID: current.id, sender }))
         yield* sessions.patchMetadata({ sessionID: current.id, metadata: { room: room.id } })
         yield* RoomDelivery.claimDelivered(db, room.id, current.id, appended.id, appended.seq)
-        yield* sync(room.id, undefined, false, false, sender === "user")
+        yield* sync(room.id)
         const metadata: RoomMetadata = { room: room.id, members: 0, seq: appended.seq, messageId: appended.id }
         return {
           title: `Room ${room.id}`,
@@ -326,7 +328,7 @@ export const RoomTool = Tool.define(
         yield* sessions.patchMetadata({ sessionID: current.id, metadata: { room: room.id } })
         const appended = yield* append(room.id, (seq) => renderEvent(room.id, "joined", current, seq, undefined, { currentID: current.id, sender }))
         yield* RoomDelivery.claimDelivered(db, room.id, current.id, appended.id, appended.seq)
-        yield* sync(room.id, undefined, false, false, sender === "user")
+        yield* sync(room.id)
         const members = yield* membersOf(room.id)
         const metadata: RoomMetadata = {
           room: room.id,
@@ -378,7 +380,12 @@ export const RoomTool = Tool.define(
         const appended = yield* append(roomID, (seq) => renderEvent(roomID, "joined", target, seq, current, { currentID: current.id, sender }))
         yield* RoomDelivery.claimDelivered(db, roomID, target.id, appended.id, appended.seq)
         yield* RoomDelivery.claimDelivered(db, roomID, current.id, appended.id, appended.seq)
-        yield* sync(roomID, undefined, false, false, sender === "user")
+        yield* sync(roomID)
+        // The target is claimed out of the joined-event fan-out, so notify it
+        // directly that it was added. Notify only: it must not be woken.
+        yield* deliver(deps, target, renderNotice(roomID, `You were added to the room by ${current.id}.`), {
+          wake: false,
+        })
         const metadata: RoomMetadata = {
           room: roomID,
           members: (yield* membersOf(roomID)).length,
@@ -414,7 +421,11 @@ export const RoomTool = Tool.define(
         yield* sessions.patchMetadata({ sessionID: target.id, metadata: { room: undefined } })
         const appended = yield* append(roomID, (seq) => renderEvent(roomID, "kicked", target, seq, current, { currentID: current.id, sender }))
         yield* RoomDelivery.claimDelivered(db, roomID, current.id, appended.id, appended.seq)
-        yield* sync(roomID, undefined, false, false, sender === "user")
+        yield* sync(roomID)
+        // Notify the removed session directly. Notify only: it must not be woken.
+        yield* deliver(deps, target, renderNotice(roomID, `You were removed from the room by ${current.id}.`), {
+          wake: false,
+        })
         const metadata: RoomMetadata = {
           room: roomID,
           members: (yield* membersOf(roomID)).length,
@@ -441,7 +452,10 @@ export const RoomTool = Tool.define(
         yield* sessions.patchMetadata({ sessionID: current.id, metadata: { room: undefined } })
         // The delivery ledger is kept on every exit path; `forget` has no callers.
         const appended = yield* append(roomID, (seq) => renderEvent(roomID, "left", current, seq, undefined, { currentID: current.id, sender }))
-        yield* sync(roomID, undefined, false, false, sender === "user")
+        yield* sync(roomID)
+        // The leaver is no longer a member, so it is not in the fan-out: notify
+        // it directly that it left. Notify only: it must not be woken.
+        yield* deliver(deps, current, renderNotice(roomID, "You left the room."), { wake: false })
         const members = yield* membersOf(roomID)
         const left: RoomMetadata = {
           room: roomID,
@@ -536,7 +550,7 @@ export const RoomTool = Tool.define(
         )
         yield* sessions.patchMetadata({ sessionID: roomID, metadata: { room_state: closed ? "closed" : "open" } })
         yield* RoomDelivery.claimDelivered(db, roomID, current.id, appended.id, appended.seq)
-        yield* sync(roomID, current.id, false, false, sender === "user")
+        yield* sync(roomID, current.id)
         const members = yield* membersOf(roomID)
         const metadata: RoomMetadata = {
           room: roomID,
@@ -578,6 +592,12 @@ export const RoomTool = Tool.define(
         )
         yield* sessions.patchMetadata({ sessionID: roomID, metadata: { room_state: "destroyed" } })
         yield* sessions.setArchived({ sessionID: roomID, time: Date.now() })
+        // Every member was cleared; notify each directly. Notify only: no wake.
+        yield* Effect.forEach(
+          members,
+          (member) => deliver(deps, member, renderNotice(roomID, "The room was destroyed."), { wake: false }),
+          { concurrency: "unbounded", discard: true },
+        )
         const metadata: RoomMetadata = { room: roomID, members: 0, seq: appended.seq, messageId: appended.id }
         return {
           title: `Destroyed ${roomID}`,

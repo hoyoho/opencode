@@ -1088,15 +1088,23 @@ export function Prompt(props: PromptProps) {
       const restOfInput = firstLineEnd === -1 ? "" : inputText.slice(firstLineEnd + 1)
       const args = firstLineArgs.join(" ") + (restOfInput ? "\n" + restOfInput : "")
 
-      void sdk.client.session.command({
-        sessionID,
-        command: command.slice(1),
-        arguments: args,
-        agent: agent.name,
-        model: `${selectedModel.providerID}/${selectedModel.modelID}`,
-        variant,
-        parts: nonTextParts.filter((x) => x.type === "file"),
-      })
+      void sdk.client.session
+        .command({
+          sessionID,
+          command: command.slice(1),
+          arguments: args,
+          agent: agent.name,
+          model: `${selectedModel.providerID}/${selectedModel.modelID}`,
+          variant,
+          parts: nonTextParts.filter((x) => x.type === "file"),
+        })
+        .catch((error) => {
+          toast.show({
+            title: `Failed to run /${command.slice(1)}`,
+            message: errorMessage(error),
+            variant: "error",
+          })
+        })
     } else {
       move.startSubmit()
       // Typing into a room session is the human speaking to the room: route it
@@ -1105,15 +1113,23 @@ export function Prompt(props: PromptProps) {
       // trace is left in any session.
       const room = sessionID ? sync.session.get(sessionID) : undefined
       if (room?.metadata?.isRoom === true) {
-        void sdk.client.session.command({
-          sessionID,
-          command: "roommgr",
-          arguments: `say ${inputText}`,
-          agent: agent.name,
-          model: `${selectedModel.providerID}/${selectedModel.modelID}`,
-          variant,
-          parts: nonTextParts.filter((x) => x.type === "file"),
-        })
+        void sdk.client.session
+          .command({
+            sessionID,
+            command: "roommgr",
+            arguments: `say ${inputText}`,
+            agent: agent.name,
+            model: `${selectedModel.providerID}/${selectedModel.modelID}`,
+            variant,
+            parts: nonTextParts.filter((x) => x.type === "file"),
+          })
+          .catch((error) => {
+            toast.show({
+              title: "Failed to post to room",
+              message: errorMessage(error),
+              variant: "error",
+            })
+          })
       } else {
         sdk.client.session
           .prompt(

@@ -592,7 +592,7 @@ export function latest(msgs: WithParts[]) {
   let finished: Assistant | undefined
   for (const msg of msgs) {
     const info = msg.info
-    if (info.role === "user" && isAfter(info, user)) user = info
+    if (info.role === "user" && drivesTurn(msg) && isAfter(info, user)) user = info
     if (info.role === "assistant" && isAfter(info, assistant)) assistant = info
     if (info.role === "assistant" && info.finish && isAfter(info, finished)) finished = info
   }
@@ -602,6 +602,21 @@ export function latest(msgs: WithParts[]) {
       : m.parts.filter((p): p is CompactionPart | SubtaskPart => p.type === "compaction" || p.type === "subtask"),
   )
   return { user, assistant, finished, tasks }
+}
+
+// A user message that only carries `ignored` text (a display-only manager
+// command echo or notification) must not become the loop's `lastUser`: it would
+// drive a model turn with no visible content and cost tokens. Anything other
+// than ignored text counts, so a real prompt always wins.
+function drivesTurn(msg: WithParts) {
+  // A partless user message is not a display-only echo; keep prior behavior.
+  if (msg.parts.length === 0) return true
+  return msg.parts.some((part) => {
+    if (part.type === "text") return !part.ignored && part.text !== ""
+    if (part.type === "file" || part.type === "agent" || part.type === "compaction" || part.type === "subtask")
+      return true
+    return false
+  })
 }
 
 function isAfter(info: Info, other?: Info) {

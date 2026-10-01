@@ -1901,14 +1901,17 @@ noLLMServer.instance(
   "roommgr command runs directly without the model",
   () =>
     Effect.gen(function* () {
-      const { prompt, chat } = yield* boot()
+      const { prompt, sessions, chat } = yield* boot()
 
+      // A state change writes nothing to the session; the effect (metadata) is
+      // what is observable.
       const created = yield* prompt.command({ sessionID: chat.id, command: "roommgr", arguments: "new Direct" })
       expect(created.info.role).toBe("assistant")
-      const createdText = created.parts.findLast((part) => part.type === "text")?.text ?? ""
-      expect(createdText).toContain("Room created")
+      expect(roomOf(yield* sessions.get(chat.id))).toBeDefined()
 
+      // A query returns its ignored result.
       const status = yield* prompt.command({ sessionID: chat.id, command: "roommgr", arguments: "status" })
+      expect(status.info.role).toBe("assistant")
       const statusText = status.parts.findLast((part) => part.type === "text")?.text ?? ""
       expect(statusText).toContain("<room_members>")
     }),
@@ -1929,11 +1932,12 @@ noLLMServer.instance(
   { config: cfg },
 )
 
-// P0-C: a manager command must be refused while a turn is running, and must not
-// write anything. Without the guard its directReply assistant message satisfies
-// the loop exit test (prompt.ts:1134-1139) and truncates the in-flight turn.
+// A manager command runs even while a turn is running, but must not write a
+// synthetic echo into the transcript: its assistant reply would satisfy the
+// loop exit test (prompt.ts) and truncate the in-flight turn, surfacing it as
+// interrupted. The side effect still applies immediately.
 it.instance(
-  "roommgr is refused while a turn is running and leaves the turn intact",
+  "roommgr applies while a turn is running without truncating it",
   () =>
     Effect.gen(function* () {
       const { llm } = yield* useServerConfig(providerCfg)
@@ -1957,17 +1961,15 @@ it.instance(
       yield* llm.wait(1)
       yield* waitForBusy(chat.id)
 
-      const exit = yield* prompt
-        .command({ sessionID: chat.id, command: "roommgr", arguments: "new Busy" })
-        .pipe(Effect.exit)
-      expect(Exit.isFailure(exit)).toBe(true)
-      if (Exit.isFailure(exit)) expect(Cause.squash(exit.cause)).toBeInstanceOf(Session.BusyError)
+      yield* prompt.command({ sessionID: chat.id, command: "roommgr", arguments: "new Busy" })
+      expect(roomOf(yield* sessions.get(chat.id))).toBeDefined()
 
       yield* Deferred.succeed(gate, void 0)
       yield* Fiber.await(fiber)
 
       const msgs = yield* sessions.messages({ sessionID: chat.id })
       const users = msgs.filter((m) => m.info.role === "user")
+      // No command line is written; only the real prompt remains.
       expect(users).toHaveLength(1)
       const first = msgs.find((m) => m.info.role === "assistant")
       expect(first?.info.role === "assistant" ? first.info.finish : undefined).toBe("stop")
@@ -1975,10 +1977,11 @@ it.instance(
   { config: cfg },
 )
 
-// P0-C: the same guard must hold across processes, where the local
-// SessionRunState map is empty. A foreign live lease is the only signal.
+// The same holds across processes, where the local SessionRunState map is empty
+// and a foreign live lease is the only signal: apply the side effect, but leave
+// the transcript untouched so the owner's turn is not truncated.
 it.instance(
-  "roommgr is refused while another process holds the session lease",
+  "roommgr applies while another process holds the session lease",
   () =>
     Effect.gen(function* () {
       const database = yield* Database.Service
@@ -1989,22 +1992,20 @@ it.instance(
       yield* SessionLease.ensure(database.db)
       yield* SessionLease.claim(database.db, chat.id, 30_000, "another-process")
 
-      const exit = yield* prompt
-        .command({ sessionID: chat.id, command: "roommgr", arguments: "new Leased" })
-        .pipe(Effect.exit)
-      expect(Exit.isFailure(exit)).toBe(true)
+      yield* prompt.command({ sessionID: chat.id, command: "roommgr", arguments: "new Leased" })
+      expect(roomOf(yield* sessions.get(chat.id))).toBeDefined()
 
       const msgs = yield* sessions.messages({ sessionID: chat.id })
+      // A state change writes nothing to the session.
       expect(msgs.filter((m) => m.info.role === "user")).toHaveLength(0)
     }),
   { config: cfg },
 )
 
-// leave/destroy are the escape hatch out of a room. Unlike the other manager
-// commands, they must still run while the session is busy (for example, woken
-// by a room post): the running turn is interrupted instead of refusing.
+// leave/destroy are not special: they apply while the session is busy without
+// interrupting the running turn. Only ESC aborts a turn.
 it.instance(
-  "roommgr leave interrupts a running turn instead of refusing",
+  "roommgr leave does not interrupt a running turn",
   () =>
     Effect.gen(function* () {
       const { llm } = yield* useServerConfig(providerCfg)
@@ -2031,13 +2032,13 @@ it.instance(
       yield* llm.wait(1)
       yield* waitForBusy(chat.id)
 
-      const left = yield* prompt.command({ sessionID: chat.id, command: "roommgr", arguments: "leave" })
-      const text = left.parts.findLast((part) => part.type === "text")?.text ?? ""
-      expect(text).toContain("Left room")
+      yield* prompt.command({ sessionID: chat.id, command: "roommgr", arguments: "leave" })
       expect(roomOf(yield* sessions.get(chat.id))).toBeUndefined()
 
+      // The running turn is untouched: releasing the gate lets it finish.
       yield* Deferred.succeed(gate, void 0)
-      yield* Fiber.await(fiber).pipe(Effect.exit)
+      const exit = yield* Fiber.await(fiber).pipe(Effect.exit)
+      expect(Exit.isSuccess(exit)).toBe(true)
     }),
   { config: cfg },
 )
@@ -2060,7 +2061,7 @@ it.instance(
 )
 
 noLLMServer.instance(
-  "roommgr records one user turn and one parented assistant reply per command",
+  "roommgr writes no command line, and a query only its ignored result",
   () =>
     Effect.gen(function* () {
       const { prompt, sessions, chat } = yield* boot()
@@ -2069,39 +2070,24 @@ noLLMServer.instance(
       yield* prompt.command({ sessionID: chat.id, command: "roommgr", arguments: "status" })
 
       const msgs = yield* sessions.messages({ sessionID: chat.id })
-      expect(msgs).toHaveLength(4)
-      expect(msgs.map((m) => m.info.role)).toEqual(["user", "assistant", "user", "assistant"])
+      // `new` writes nothing; `status` writes only its result.
+      expect(msgs).toHaveLength(1)
+      expect(msgs[0].info.role).toBe("assistant")
 
-      const text = (m: SessionV1.WithParts) =>
-        m.parts.flatMap((part) => (part.type === "text" && !part.synthetic ? [part.text] : [])).join("")
-      expect(text(msgs[0])).toBe("/roommgr new Direct")
-      expect(text(msgs[2])).toBe("/roommgr status")
-
-      // The user's operation log is visible in the transcript but marked
-      // `ignored`, so it is never sent to the model (no god-view trace).
+      // The query result is `ignored`: never sent to the model (no god-view
+      // trace, no tokens).
       const everyTextIgnored = (m: SessionV1.WithParts) =>
         m.parts.flatMap((part) => (part.type === "text" ? [part.ignored === true] : [])).every(Boolean)
       expect(everyTextIgnored(msgs[0])).toBe(true)
-      expect(everyTextIgnored(msgs[2])).toBe(true)
-
-      // The reply must hang off the command turn it answers: this linkage is
-      // what the loop exit test keys on.
-      const parentOf = (index: number) => {
-        const info = msgs[index].info
-        if (info.role !== "assistant") throw new Error(`expected assistant at ${index}`)
-        return info.parentID
-      }
-      expect(parentOf(1)).toBe(msgs[0].info.id)
-      expect(parentOf(3)).toBe(msgs[2].info.id)
     }),
   { config: cfg },
 )
 
-// A manager command is a god-view operation: its command line and reply are
-// `ignored`, so no model perceives them (no tokens), while the user still sees
-// them in the TUI.
+// A manager command is a god-view operation: its command line is never written,
+// so the model never sees the action. The `say` content itself is delivered to
+// the room as a visible user message, so the model sees the result.
 noLLMServer.instance(
-  "a manager command's log and reply stay out of the model context",
+  "a manager command's log stays out of the model context while its say content is visible",
   () =>
     Effect.gen(function* () {
       const { prompt, sessions, chat } = yield* boot()
@@ -2114,6 +2100,7 @@ noLLMServer.instance(
       expect(visible).toHaveLength(0)
 
       const msgs = yield* sessions.messages({ sessionID: chat.id })
+      // No assistant receipt is written for a message command.
       const replyVisible = msgs.flatMap((message) =>
         message.parts.flatMap((part) =>
           part.type === "text" && !part.synthetic && !part.ignored && part.text.includes("Message posted")
@@ -2122,6 +2109,14 @@ noLLMServer.instance(
         ),
       )
       expect(replyVisible).toHaveLength(0)
+      // But the say content is delivered into the speaker's own session as a
+      // visible (non-ignored) room message.
+      const saidVisible = msgs.flatMap((message) =>
+        message.parts.flatMap((part) =>
+          part.type === "text" && !part.ignored && part.text.includes("hello all") ? [part.text] : [],
+        ),
+      )
+      expect(saidVisible.length).toBeGreaterThan(0)
     }),
   { config: cfg },
 )
@@ -2160,10 +2155,9 @@ noLLMServer.instance(
       // A non-member room id does reach the tool, which is why a live canary
       // needs a real room id rather than a bare subcommand.
       const other = yield* sessions.create({ title: "Other", agent: "build" })
-      const created = yield* prompt.command({ sessionID: other.id, command: "roommgr", arguments: "new Canary" })
-      const createdText = created.parts.findLast((part) => part.type === "text")?.text ?? ""
-      const room = createdText.match(/<room id="(ses_[^"]+)"/)?.[1]
-      if (!room) throw new Error(`no room id in: ${createdText}`)
+      yield* prompt.command({ sessionID: other.id, command: "roommgr", arguments: "new Canary" })
+      const room = roomOf(yield* sessions.get(other.id))
+      if (!room) throw new Error("room was not created")
       const targeted = yield* prompt.command({
         sessionID: chat.id,
         command: "roommgr",

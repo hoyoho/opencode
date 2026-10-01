@@ -113,8 +113,7 @@ const layer = Layer.effect(
       }
       commands[Default.ROOMMGR] = {
         name: Default.ROOMMGR,
-        description:
-          "manage shared rooms (new|destroy|join|leave|invite|kick|close|open|say|status) - runs directly without the model",
+        description: "manage shared rooms (new|destroy|join|leave|invite|kick|close|open|say|status)",
         source: "command",
         get template() {
           return ROOMMGR_USAGE
@@ -123,8 +122,7 @@ const layer = Layer.effect(
       }
       commands[Default.PARTNERMGR] = {
         name: Default.PARTNERMGR,
-        description:
-          "manage partnerships and messaging (add|remove|leave|broadcast|status) - runs directly without the model",
+        description: "manage partnerships and messaging (add|remove|leave|broadcast|status)",
         source: "command",
         get template() {
           return PARTNERMGR_USAGE
